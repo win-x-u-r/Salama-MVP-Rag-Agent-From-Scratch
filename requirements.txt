@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-dotenv
+langgraph
+langchain
+langchain-openai
+langchain-community
+langchain-text-splitters
+fastembed
+pydantic
