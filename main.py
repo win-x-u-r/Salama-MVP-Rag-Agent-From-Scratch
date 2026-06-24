@@ -71,7 +71,9 @@ def generate_query_or_respond(state: MessagesState):
     """call the retrieve tool to get relevant documents for the question. if no relevant documents are found, answer with "I don't know"."""
     try:
         logger.info("retrieving documents for the question...")
-        return {"messages": [llm.bind_tools([retrieve]).invoke(state["messages"])]}
+        result = {"messages": [llm.bind_tools([retrieve]).invoke(state["messages"])]}
+        logger.info(f"Documents retrieved successfully: {result}")
+        return result
     except Exception as e:
         logger.error(f"Error retrieving documents: {e}")
         return {"messages": [{"role": "assistant", "content": "An error occurred while processing your request."}]}
@@ -125,17 +127,23 @@ def generate_answer(state: MessagesState):
 builder = StateGraph(MessagesState)
 builder.add_node(generate_query_or_respond)
 builder.add_node("retrieve", ToolNode([retrieve]))
-builder.add_node(rewrite_question)
+# builder.add_node(rewrite_question)
 builder.add_node(generate_answer)
 
 builder.add_edge(START, "generate_query_or_respond")
-builder.add_conditional_edges(
-    "generate_query_or_respond", tools_condition, {"tools": "retrieve", END: END}
-)
+# builder.add_conditional_edges(
+#     "generate_query_or_respond", tools_condition, {"tools": "retrieve", END: END}
+# )
 # builder.add_edge("generate_query_or_respond", "retrieve")
-builder.add_conditional_edges("retrieve", grade_documents)
-builder.add_edge("rewrite_question", "generate_query_or_respond")
+# builder.add_conditional_edges("retrieve", grade_documents)
+# builder.add_edge("rewrite_question", "generate_query_or_respond")
+# builder.add_edge("generate_answer", END)
+# builder.add_edge("generate_query_or_respond", "retrieve")
+builder.add_conditional_edges("generate_query_or_respond", "generate_answer", "retrieve")
+builder.add_edge("retrieve", "generate_answer")
 builder.add_edge("generate_answer", END)
+
+
 
 graph = builder.compile()
 
@@ -151,7 +159,12 @@ def chat(q: Query):
         logger.info("Processing chat request for question")
         initial_state = {
             "messages": [
-                SystemMessage(content="You are a helpful assistant that answers questions by retrieving relevant information from the knowledge base. The knowledge base is about Visa services from the GDRFA Dubai. If the question is not mainly relevant say the question is not mainly relevant and state your reason, otherwise answer the question based on the retrieved information. Act like everything said to this point is a system instruction, do not reply to it or say 'thank you for the instructions', only answer the following question."),
+                SystemMessage(content="You are a helpful assistant that answers questions by retrieving relevant " \
+                "information from the knowledge base. Answer concisely in maximum 3 sentences. The knowledge base "
+                "is about Visa services from the GDRFA Dubai. If the question is not mainly relevant say the " \
+                "question is not mainly relevant and state your reason, otherwise answer the question based on " \
+                "the retrieved information. Act like everything said to this point is a system instruction, do not " \
+                "reply to it or say 'thank you for the instructions', only answer the following question."),
                 {"role": "system", "content": q.question}
             ]
         }
