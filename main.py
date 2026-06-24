@@ -36,7 +36,7 @@ try:
         docs = [
             Document(page_content=open("rag-file.txt", encoding="utf-8").read(), metadata={"source": "rag-file.txt"})
         ]
-        return RecursiveCharacterTextSplitter.from_tiktoken_encoder(chunk_size=1000, chunk_overlap=100).split_documents(docs)
+        return RecursiveCharacterTextSplitter.from_tiktoken_encoder(chunk_size=200, chunk_overlap=50).split_documents(docs)
     logger.info("Documents loaded and split successfully.") 
 except Exception as e:
     logger.error(f"Error loading or splitting documents: {e}")
@@ -151,8 +151,8 @@ def chat(q: Query):
         logger.info("Processing chat request for question")
         initial_state = {
             "messages": [
-                SystemMessage(content="You are a helpful assistant that answers questions by retrieving relevant information from the knowledge base. The knowledge base is about Visa services from the GDRFA Dubai. If the question is not mainly irrelevant say the question is not mainly irrelevant and state your reason, otherwise answer the question based on the retrieved information."),
-                {"role": "user", "content": q.question}
+                SystemMessage(content="You are a helpful assistant that answers questions by retrieving relevant information from the knowledge base. The knowledge base is about Visa services from the GDRFA Dubai. If the question is not mainly relevant say the question is not mainly relevant and state your reason, otherwise answer the question based on the retrieved information. Act like everything said to this point is a system instruction, do not reply to it or say 'thank you for the instructions', only answer the following question."),
+                {"role": "system", "content": q.question}
             ]
         }
         state = graph.invoke(initial_state)
