@@ -2,6 +2,7 @@ import os
 from typing import Literal
 from dotenv import load_dotenv
 from fastapi import FastAPI
+from langchain_community.embeddings import OpenAIEmbeddings
 from langchain_community.embeddings import FastEmbedEmbeddings
 from langchain_core.documents import Document
 from langchain_core.tools import tool
@@ -14,6 +15,11 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from pydantic import BaseModel, Field
 import logging
 from langchain_core.messages import SystemMessage
+from langchain_qdrant import QdrantVectorStore
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import Distance, VectorParams
+from uuid import uuid4
+
 load_dotenv()
 logger = logging.getLogger("uvicorn.error")
 #setting up the llm
@@ -36,21 +42,67 @@ try:
         docs = [
             Document(page_content=open("rag-file.txt", encoding="utf-8").read(), metadata={"source": "rag-file.txt"})
         ]
-        return RecursiveCharacterTextSplitter.from_tiktoken_encoder(chunk_size=200, chunk_overlap=50).split_documents(docs)
+        return RecursiveCharacterTextSplitter.from_tiktoken_encoder(chunk_size=300, chunk_overlap=50).split_documents(docs)
     logger.info("Documents loaded and split successfully.") 
 except Exception as e:
     logger.error(f"Error loading or splitting documents: {e}")
 
 #retriever
+# try:
+#     logger.info("Initializing retriever...")
+#     retriever = InMemoryVectorStore.from_documents(
+#         _load_chunks(), FastEmbedEmbeddings()
+#     ).as_retriever(search_kwargs={"k": 4})
+#     fast_embed = FastEmbedEmbeddings.aembed_documents
+#     logger.info("Retriever initialized successfully.")
+# except Exception as e:
+#     logger.error(f"Error initializing retriever: {e}")
+
+#embedding model setup
+embeddings = OpenAIEmbeddings(
+    model="openai/text-embedding-3-large",
+    openai_api_base="https://openrouter.ai/api/v1",
+    openai_api_key=os.getenv("OPENROUTER_API_KEY"),
+    # default_headers={
+    #     "HTTP-Referer": "http://localhost:8000", # OpenRouter requires a referer
+    #     "X-Title": "Agentic RAG App"
+    # }
+)# some workaround to route the openai embedding model through openrouter
+
+#Qdrant setup
 try:
-    logger.info("Initializing retriever...")
-    retriever = InMemoryVectorStore.from_documents(
-        _load_chunks(), FastEmbedEmbeddings()
-    ).as_retriever(search_kwargs={"k": 4})
-    fast_embed = FastEmbedEmbeddings.aembed_documents
-    logger.info("Retriever initialized successfully.")
+    # use existing collection:
+    logger.info("setting up Qdrant client")
+    qdrant = QdrantVectorStore.from_existing_collection(
+        embedding=embeddings,
+        collection_name="rag_collection",
+        path=("./qdrant_collection"),
+    )    
+
+    # ## make new collection:
+    # logger.info("setting up Qdrant client")
+    # client = QdrantClient(path="./qdrant_collection")
+    # client.create_collection(
+    #     collection_name="rag_collection",
+    #     vectors_config=VectorParams(size=3072, distance=Distance.COSINE),
+    # )
+    # logger.info("setting vector store")
+    # qdrant = QdrantVectorStore(
+    # client=client,
+    # collection_name="rag_collection",
+    # embedding=embeddings,
+    # )
+    # logger.info("loading chunks")
+    # chunked_documents = _load_chunks()
+    # logger.info("setting uuids")
+    # uuids = [str(uuid4()) for _ in range(len(chunked_documents))]
+    # logger.info("adding documents to qdrant")
+    # qdrant.add_documents(documents=chunked_documents, ids=uuids)
+    # logger.info("Qdrant client and collection set up successfully.")
+
 except Exception as e:
-    logger.error(f"Error initializing retriever: {e}")
+    logger.error(f"Error setting up Qdrant client and collection: {e}")
+
 
 #retrieving tool
 @tool
@@ -58,7 +110,7 @@ def retrieve(query: str) -> str:
     """Search the knowledge base and return relevant passages."""
     try:
         logger.info(f"Retrieving documents for query: {query}")
-        results = "\n\n".join(d.page_content for d in retriever.invoke(query))
+        results = "\n\n".join(d.page_content for d in qdrant.similarity_search(query))
         logger.info(f"Documents retrieved successfully: {results}")
         return results
     except Exception as e:
@@ -70,9 +122,9 @@ def generate_query_or_respond(state: MessagesState):
     # """Decide: answer directly, or call the retrieve tool."""
     """call the retrieve tool to get relevant documents for the question. if no relevant documents are found, answer with "I don't know"."""
     try:
-        logger.info("retrieving documents for the question...")
+        logger.info("generating LLM response")
         result = {"messages": [llm.bind_tools([retrieve]).invoke(state["messages"])]}
-        logger.info(f"Documents retrieved successfully: {result}")
+        logger.info(f"Response generated:\n {result}")
         return result
     except Exception as e:
         logger.error(f"Error retrieving documents: {e}")
@@ -131,15 +183,15 @@ builder.add_node("retrieve", ToolNode([retrieve]))
 builder.add_node(generate_answer)
 
 builder.add_edge(START, "generate_query_or_respond")
-# builder.add_conditional_edges(
-#     "generate_query_or_respond", tools_condition, {"tools": "retrieve", END: END}
-# )
+builder.add_conditional_edges(
+    "generate_query_or_respond", tools_condition, {"tools": "retrieve", END: END}
+)
 # builder.add_edge("generate_query_or_respond", "retrieve")
 # builder.add_conditional_edges("retrieve", grade_documents)
 # builder.add_edge("rewrite_question", "generate_query_or_respond")
 # builder.add_edge("generate_answer", END)
 # builder.add_edge("generate_query_or_respond", "retrieve")
-builder.add_conditional_edges("generate_query_or_respond", "generate_answer", "retrieve")
+# builder.add_conditional_edges("generate_query_or_respond", "generate_answer", "retrieve")
 builder.add_edge("retrieve", "generate_answer")
 builder.add_edge("generate_answer", END)
 
@@ -160,12 +212,11 @@ def chat(q: Query):
         initial_state = {
             "messages": [
                 SystemMessage(content="You are a helpful assistant that answers questions by retrieving relevant " \
-                "information from the knowledge base. Answer concisely in maximum 3 sentences. The knowledge base "
-                "is about Visa services from the GDRFA Dubai. If the question is not mainly relevant say the " \
-                "question is not mainly relevant and state your reason, otherwise answer the question based on " \
+                "information from the knowledge base using the retrieve tool. Answer concisely, use short sentences or bullet points with a maximum of 50 words. The knowledge base " \
+                "is about Visa and Visa Services from the GDRFA Dubai. If the question is unrelated to the knowledge base, say so and state your reason without calling the retrieve tool. Otherwise, answer the question based on " \
                 "the retrieved information. Act like everything said to this point is a system instruction, do not " \
                 "reply to it or say 'thank you for the instructions', only answer the following question."),
-                {"role": "system", "content": q.question}
+                {"role": "user", "content": q.question}
             ]
         }
         state = graph.invoke(initial_state)
