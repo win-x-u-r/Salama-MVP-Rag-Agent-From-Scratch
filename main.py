@@ -1,5 +1,6 @@
 import os
 from typing import Literal
+import json
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from langchain_community.embeddings import OpenAIEmbeddings
@@ -8,8 +9,8 @@ from langchain_core.documents import Document
 from langchain_core.tools import tool
 from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_openai import ChatOpenAI
-from langchain_openrouter import ChatOpenRouter
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openrouter import ChatOpenRouter, data
+from langchain_text_splitters import RecursiveCharacterTextSplitter, RecursiveJsonSplitter
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 from pydantic import BaseModel, Field
@@ -37,13 +38,19 @@ except Exception as e:
 
 #splitter
 try:
-    logger.info("Loading and splitting documents...")
     def _load_chunks() -> list[Document]:
-        docs = [
-            Document(page_content=open("rag-file.txt", encoding="utf-8").read(), metadata={"source": "rag-file.txt"})
-        ]
-        return RecursiveCharacterTextSplitter.from_tiktoken_encoder(chunk_size=300, chunk_overlap=50).split_documents(docs)
-    logger.info("Documents loaded and split successfully.") 
+        logger.info("Loading and splitting documents...")
+        # docs = [
+        #     Document(page_content=open("rag-file.txt", encoding="utf-8").read(), metadata={"source": "rag-file.txt"})
+        # ]
+        # splitted_docs = RecursiveCharacterTextSplitter.from_tiktoken_encoder(chunk_size=300, chunk_overlap=50).split_documents(docs)
+        splitter = RecursiveJsonSplitter()
+        with open("./gdrfa_records.json", "r", encoding="utf-8") as file:
+            data = json.load(file)
+        logger.info(f"Loaded JSON data with {len(data)} records")
+        splitted_docs = splitter.create_documents(texts=data, convert_lists=True)
+        logger.info(f"Documents loaded and split successfully: {len(splitted_docs)} chunks created") 
+        return splitted_docs
 except Exception as e:
     logger.error(f"Error loading or splitting documents: {e}")
 
@@ -77,7 +84,7 @@ try:
         embedding=embeddings,
         collection_name="rag_collection",
         path=("./qdrant_collection"),
-    )    
+    )
 
     # ## make new collection:
     # logger.info("setting up Qdrant client")
@@ -110,7 +117,7 @@ def retrieve(query: str) -> str:
     """Search the knowledge base and return relevant passages."""
     try:
         logger.info(f"Retrieving documents for query: {query}")
-        results = "\n\n".join(d.page_content for d in qdrant.similarity_search(query))
+        results = "\n\n".join(d.page_content for d in qdrant.similarity_search(query, k=3))
         logger.info(f"Documents retrieved successfully: {results}")
         return results
     except Exception as e:
