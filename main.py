@@ -96,7 +96,7 @@ try:
         path=("./qdrant_collection"),
     )
 
-    # ## make new collection:
+    # # make new collection:
     # logger.info("setting up Qdrant client")
     # client = QdrantClient(path="./qdrant_collection")
     # client.create_collection(
@@ -128,10 +128,10 @@ def retrieve(query: str, k: int = 3) -> str:
 
     Args:
         query: What to search for.
-        k: How many passages to return. Use a LARGER value (6-8) for broad,
+        k: How many passages to return. Use a LARGER value (6-10) for broad,
            definitional, or "list all"-style questions (e.g. "what is the golden
            visa", "what visa types exist") since the answer may span several
-           services. Use a SMALL value (2-3) for narrow factual lookups
+           services. Use a SMALL value (2-4) for narrow factual lookups
            (a single fee, date, GPA, or document requirement).
     """
     try:
@@ -224,7 +224,7 @@ def generate_answer(state: MessagesState):
             "Innovation Dirham, VAT) and give an approximate total. Exclude optional or "
             "in-country-only fees unless asked.\n"
             "Be concise: short sentences or bullet points, max ~50 words. "
-            "If the answer is not in the context, say you don't know.\n\n"
+            "If the answer is not in the context, say  'I don't know'.\n\n"
             f"Question: {question}\n\nContext:\n{context}"
         ).content
         logger.info(f"[timing] generate_answer (LLM): {time.perf_counter() - t0:.2f}s")
