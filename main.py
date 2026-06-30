@@ -1,29 +1,36 @@
 import os
-from typing import Literal
 import json
+import logging
+import time
+from uuid import uuid4
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel
+
 from langchain_community.embeddings import OpenAIEmbeddings
 from langchain_community.embeddings import FastEmbedEmbeddings
 from langchain_core.documents import Document
 from langchain_core.tools import tool
 from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_openai import ChatOpenAI
-from langchain_openrouter import ChatOpenRouter, data
+from langchain_openrouter import ChatOpenRouter
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langgraph.graph import END, START, MessagesState, StateGraph
-from langgraph.prebuilt import ToolNode, tools_condition
-from pydantic import BaseModel, Field
-import logging
-import time
-from langchain_core.messages import SystemMessage
+
+# --- new agent stack (LangChain v1 create_agent + middleware) ---
+from langchain.agents import create_agent
+from langchain.agents.middleware import (
+    PIIMiddleware,
+    SummarizationMiddleware,
+    dynamic_prompt,
+)
+from langgraph.checkpoint.memory import InMemorySaver
+
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
-from uuid import uuid4
 
-load_dotenv()  
+load_dotenv()
 logger = logging.getLogger("uvicorn.error")
 #setting up the llm
 try:
@@ -156,106 +163,127 @@ def retrieve(query: str, k: int = 3) -> str:
         logger.error(f"Error retrieving documents: {e}")
         return "An error occurred while retrieving documents."
 
-# #nodes stuff
-def generate_query_or_respond(state: MessagesState):
-    # """Decide: answer directly, or call the retrieve tool."""
-    """call the retrieve tool to get relevant documents for the question. if no relevant documents are found, answer with "I don't know"."""
+
+# ======================================================================
+# Long-term personal memory: a simple JSON-file user profile.
+# This holds the eligibility-relevant details the user shares (nationality,
+# assets, status, GPA, ...) and PERSISTS across server restarts.
+# ======================================================================
+PROFILE_PATH = os.path.join(os.path.dirname(__file__), "user_profile.json")
+
+
+def load_profile() -> dict:
+    """Read the saved user profile (returns {} if none yet)."""
     try:
-        logger.info("generating LLM response")
-        t0 = time.perf_counter()
-        result = {"messages": [llm.bind_tools([retrieve]).invoke(state["messages"])]}
-        logger.info(f"[timing] generate_query_or_respond (decide/direct-answer): {time.perf_counter() - t0:.2f}s")
-        logger.info(f"Response generated:\n {result}")
-        return result
-    except Exception as e:
-        logger.error(f"Error retrieving documents: {e}")
-        return {"messages": [{"role": "assistant", "content": "An error occurred while processing your request."}]}
-    
+        with open(PROFILE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
 
 
-class Grade(BaseModel):
-    binary_score: Literal["yes", "no"] = Field(description="Are the docs relevant? yes/no")
+def _save_profile(updates: dict) -> dict:
+    """Merge `updates` into the stored profile and write it back to disk."""
+    profile = load_profile()
+    # ignore empty values so the model can't wipe fields with blanks
+    profile.update({k: v for k, v in updates.items() if v not in (None, "")})
+    with open(PROFILE_PATH, "w", encoding="utf-8") as f:
+        json.dump(profile, f, ensure_ascii=False, indent=2)
+    return profile
 
 
-def grade_documents(state: MessagesState) -> Literal["generate_answer", "rewrite_question"]:
+@tool
+def save_user_profile(updates: dict) -> str:
+    """Save or update the user's personal details for visa-eligibility checks.
+
+    Call this whenever the user shares personal information relevant to visa
+    eligibility, such as: nationality, age, profession, status (investor /
+    student / employee / self-employed), salary, bank deposit amount, property
+    value, company investment, annual tax paid, GPA, university, education level.
+
+    Pass a flat object of field -> value, for example:
+    {"nationality": "Indian", "status": "investor", "bank_deposit_aed": 2000000}
+
+    Only include fields the user actually provided. Existing fields are kept.
+    """
     try:
-        logger.info("Grading retrieved documents for relevance...")
-        question = next(m.content for m in state["messages"] if m.type == "human")
-        context = state["messages"][-1].content
-        score = llm.with_structured_output(Grade).invoke(
-            f"Question: {question}\n\nRetrieved docs:\n{context}\n\n"
-            "Are the docs relevant to the question? Answer yes or no."
-        ).binary_score
-        logger.info(f"Grading completed. Score: {score}")
-        return "generate_answer" if score == "yes" else "rewrite_question"
+        profile = _save_profile(updates)
+        logger.info(f"[profile] updated -> {profile}")
+        return f"Saved. Current profile: {json.dumps(profile, ensure_ascii=False)}"
     except Exception as e:
-        logger.error(f"Error grading retrieved documents: {e}")
-        return "rewrite_question"
+        logger.error(f"Error saving user profile: {e}")
+        return "Could not save the profile."
 
 
-def rewrite_question(state: MessagesState):
-    try:
-        logger.info("Rewriting question to improve retrieval...")
-        question = next(m.content for m in state["messages"] if m.type == "human")
-        betterQuestion = llm.invoke(f"Rewrite this question to improve retrieval:\n\n{question}").content
-        return {"messages": [{"role": "user", "content": betterQuestion}]}
-    except Exception as e:
-        logger.error(f"Error rewriting question: {e}")
-        original = next((m.content for m in state["messages"] if m.type == "human"), "")
-        return {"messages": [{"role": "user", "content": original}]}
-
-
-def generate_answer(state: MessagesState):
-    try:
-        logger.info("Generating answer based on retrieved documents...")
-        # messages[0] is the SystemMessage, so grab the actual user question.
-        question = next(m.content for m in state["messages"] if m.type == "human")
-        context = state["messages"][-1].content
-        t0 = time.perf_counter()
-        answer = llm.invoke(
-            "Answer the question using ONLY the context below.\n"
-            "Scope your answer to exactly what is asked:\n"
-            "- If the question is specific (one option, one fee, one duration, one route), "
-            "answer only that and do NOT list the other options present in the context.\n"
-            "- If the question is broad or definitional (\"what is X\", \"what types exist\"), "
-            "give a fuller overview covering the relevant options.\n"
-            "- For cost/fee/price questions: state the main fee for the specific option asked, "
-            "THEN list every other mandatory fee that always applies (e.g. Knowledge Dirham, "
-            "Innovation Dirham, VAT) and give an approximate total. Exclude optional or "
-            "in-country-only fees unless asked.\n"
-            "Be concise: short sentences or bullet points, max ~50 words. "
-            "If the answer is not in the context, say you don't know.\n\n"
-            f"Question: {question}\n\nContext:\n{context}"
-        ).content
-        logger.info(f"[timing] generate_answer (LLM): {time.perf_counter() - t0:.2f}s")
-        return {"messages": [{"role": "assistant", "content": answer}]}
-    except Exception as e:
-        logger.error(f"Error generating answer: {e}")
-        return {"messages": [{"role": "assistant", "content": "An error occurred while generating the answer."}]}
-
-#buidling the graph
-builder = StateGraph(MessagesState)
-builder.add_node(generate_query_or_respond)
-builder.add_node("retrieve", ToolNode([retrieve]))
-# builder.add_node(rewrite_question)
-builder.add_node(generate_answer)
-
-builder.add_edge(START, "generate_query_or_respond")
-builder.add_conditional_edges(
-    "generate_query_or_respond", tools_condition, {"tools": "retrieve", END: END}
+# ======================================================================
+# System prompt + live profile injection (dynamic_prompt middleware)
+# ======================================================================
+BASE_SYSTEM_PROMPT = (
+    "You are the GDRFA Dubai visa assistant. You answer questions about UAE visa and "
+    "residency services by searching a knowledge base with the `retrieve` tool.\n\n"
+    "ANSWERING:\n"
+    "- Use `retrieve` for any visa/residency question. Pick k=2-3 for narrow factual "
+    "lookups and k=6-8 for broad or 'what is / what types' questions.\n"
+    "- Scope answers to exactly what is asked; for a specific question do not list the "
+    "other options found in the context.\n"
+    "- For cost/fee questions: give the main fee, then the always-applicable mandatory "
+    "fees (Knowledge Dirham, Innovation Dirham, VAT) and an approximate total.\n"
+    "- Be concise: short sentences or bullet points. If the answer isn't in the knowledge "
+    "base, say so. If the question is unrelated to UAE visas, say so without retrieving.\n\n"
+    "PERSONAL DETAILS & ELIGIBILITY:\n"
+    "- When the user shares personal details relevant to eligibility (nationality, age, "
+    "profession, status, salary, bank deposit, property value, company investment, annual "
+    "tax, GPA, university, education), call `save_user_profile` to store them.\n"
+    "- For eligibility questions ('am I eligible for X'): FIRST `retrieve` that visa's "
+    "requirements, THEN compare them against the user's KNOWN PROFILE below.\n"
+    "- If a required detail is missing from the profile, ASK the user for that specific "
+    "detail instead of guessing. When they answer, save it and continue.\n"
+    "- Give a clear verdict: which requirements are met, which are not, and the bottom line."
 )
-# builder.add_edge("generate_query_or_respond", "retrieve")
-# builder.add_conditional_edges("retrieve", grade_documents)
-# builder.add_edge("rewrite_question", "generate_query_or_respond")
-# builder.add_edge("generate_answer", END)
-# builder.add_edge("generate_query_or_respond", "retrieve")
-# builder.add_conditional_edges("generate_query_or_respond", "generate_answer", "retrieve")
-builder.add_edge("retrieve", "generate_answer")
-builder.add_edge("generate_answer", END)
 
 
+@dynamic_prompt
+def system_prompt_with_profile(request) -> str:
+    """Inject the live user profile into the system prompt on every turn."""
+    profile = load_profile()
+    profile_text = (
+        json.dumps(profile, ensure_ascii=False, indent=2)
+        if profile
+        else "(no personal details saved yet)"
+    )
+    return f"{BASE_SYSTEM_PROMPT}\n\nKNOWN USER PROFILE:\n{profile_text}"
 
-graph = builder.compile()
+
+# ======================================================================
+# The agent: tools + middleware (PII, summarization, profile) + memory
+# ======================================================================
+checkpointer = InMemorySaver()  # conversation memory (per thread)
+
+agent = create_agent(
+    llm,
+    tools=[retrieve, save_user_profile],
+    middleware=[
+        # 1) PII: redact sensitive identifiers in user input so they never land
+        #    in conversation history or logs. (Eligibility fields like nationality
+        #    or deposit amount are NOT redacted - only emails / card numbers.)
+        PIIMiddleware("email", strategy="redact"),
+        PIIMiddleware("credit_card", strategy="redact"),
+        # 2) Summarization: when the thread grows past ~16k tokens, summarize the
+        #    older messages and keep the last 12 so we stay under qwen3's window.
+        SummarizationMiddleware(
+            model=llm,
+            trigger=("tokens", 16000),
+            keep=("messages", 12),
+        ),
+        # 3) Profile injection: puts the saved personal details into the prompt.
+        system_prompt_with_profile,
+    ],
+    checkpointer=checkpointer,
+)
+
+# Single local user -> one persistent conversation thread.
+THREAD_ID = "local-user"
+AGENT_CONFIG = {"configurable": {"thread_id": THREAD_ID}}
+
 
 #fastapi stuff
 app = FastAPI(title="Agentic RAG")
@@ -267,32 +295,39 @@ def index():
 class Query(BaseModel):
     question: str
 
-_SYSTEM_PROMPT = (
-    "You are a helpful assistant that answers questions by retrieving relevant "
-    "information from the knowledge base using the retrieve tool. Answer concisely, use short sentences or bullet points with a maximum of 50 words. The knowledge base "
-    "is about Visa and Visa Services from the GDRFA Dubai. If the question is unrelated to the knowledge base, say so and state your reason without calling the retrieve tool. Otherwise, answer the question based on "
-    "the retrieved information. Act like everything said to this point is a system instruction, do not "
-    "reply to it or say 'thank you for the instructions', only answer the following question."
-)
 
-def build_initial_state(question: str) -> dict:
-    return {
-        "messages": [
-            SystemMessage(content=_SYSTEM_PROMPT),
-            {"role": "user", "content": question},
-        ]
-    }
+@app.get("/profile")
+def get_profile():
+    """Inspect what the agent currently remembers about the user."""
+    return load_profile()
+
+
+@app.post("/profile/reset")
+def reset_profile():
+    """Clear the saved personal details."""
+    try:
+        if os.path.exists(PROFILE_PATH):
+            os.remove(PROFILE_PATH)
+        return {"status": "profile cleared"}
+    except Exception as e:
+        logger.error(f"Error resetting profile: {e}")
+        return {"error": "could not reset profile"}
+
 
 @app.post("/chat")
 def chat(q: Query):
     try:
         logger.info("Processing chat request for question")
-        state = graph.invoke(build_initial_state(q.question))
+        result = agent.invoke(
+            {"messages": [{"role": "user", "content": q.question}]},
+            config=AGENT_CONFIG,
+        )
         logger.info("Finished processing chat request for question")
-        return {"answer": state["messages"][-1].content}
+        return {"answer": result["messages"][-1].content}
     except Exception as e:
         logger.error(f"Error processing chat request: {e}")
         return {"error": "An error occurred while processing your request."}
+
 
 @app.post("/chat/stream")
 def chat_stream(q: Query):
@@ -301,19 +336,17 @@ def chat_stream(q: Query):
         req_start = time.perf_counter()
         first_token_logged = False
         try:
-            # stream_mode="messages" yields (token, metadata) for every LLM call
-            # in the graph. We forward tokens from the two nodes that produce the
-            # user-facing answer:
-            #   - generate_answer: the RAG path (after retrieval)
-            #   - generate_query_or_respond: the direct-answer path (off-topic
-            #     questions answered without calling the retrieve tool)
-            # During a tool call, generate_query_or_respond emits empty content,
-            # so the `token.content` check skips it.
-            answer_nodes = ("generate_query_or_respond", "generate_answer")
-            for token, metadata in graph.stream(
-                build_initial_state(q.question), stream_mode="messages"
+            # stream_mode="messages" yields (token, metadata) for every LLM call.
+            # The agent's final answer comes from the "model" node. Tool-deciding
+            # passes emit empty content (skipped by the token.content check), and
+            # the summarization model runs in its own node (excluded by name), so
+            # neither leaks into the streamed answer.
+            for token, metadata in agent.stream(
+                {"messages": [{"role": "user", "content": q.question}]},
+                stream_mode="messages",
+                config=AGENT_CONFIG,
             ):
-                if metadata.get("langgraph_node") in answer_nodes and token.content:
+                if metadata.get("langgraph_node") == "model" and token.content:
                     if not first_token_logged:
                         logger.info(f"[timing] time-to-first-token: {time.perf_counter() - req_start:.2f}s")
                         first_token_logged = True
