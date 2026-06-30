@@ -180,10 +180,22 @@
       return html;
     }
 
+    // Some OpenRouter providers stream Qwen's tool-call markup as plain text
+    // (e.g. "<tool_call>{...}</tool_call>", sometimes mangled to "ool_call>").
+    // Strip it so it never shows in the answer. "tool_call" never appears in a
+    // real visa answer, so this is safe.
+    function stripToolMarkup(s) {
+      // remove complete tool_call blocks (tag + JSON payload)
+      s = s.replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, "");
+      // remove any standalone / mangled tool_call delimiter fragments
+      s = s.replace(/<?\/?\|?\s*t?ool_call\s*\|?>?/gi, "");
+      return s;
+    }
+
     // Bot text is markdown -> render to HTML; user/error text stays plain (safe).
     function setBubbleContent(bubble, text, role) {
       if (role === "bot") {
-        bubble.innerHTML = renderMarkdown(text);
+        bubble.innerHTML = renderMarkdown(stripToolMarkup(text));
       } else {
         bubble.textContent = text;
       }
