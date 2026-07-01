@@ -164,11 +164,7 @@ def retrieve(query: str, k: int = 3) -> str:
         return "An error occurred while retrieving documents."
 
 
-# ======================================================================
-# Long-term personal memory: a simple JSON-file user profile.
-# This holds the eligibility-relevant details the user shares (nationality,
-# assets, status, GPA, ...) and PERSISTS across server restarts.
-# ======================================================================
+# long term memory (for personal context)
 PROFILE_PATH = os.path.join(os.path.dirname(__file__), "user_profile.json")
 
 
@@ -214,20 +210,18 @@ def save_user_profile(updates: dict) -> str:
         return "Could not save the profile."
 
 
-# ======================================================================
-# System prompt + live profile injection (dynamic_prompt middleware)
-# ======================================================================
+# inject user profile in system prompt
 BASE_SYSTEM_PROMPT = (
     "You are the GDRFA Dubai visa assistant. You answer questions about UAE visa and "
     "residency services by searching a knowledge base with the `retrieve` tool.\n\n"
     "ANSWERING:\n"
-    "- Use `retrieve` for any visa/residency question. Pick k=2-3 for narrow factual "
+    "- ALWAYS Use `retrieve` for any visa/residency question. Pick k=2-3 for narrow factual "
     "lookups and k=6-8 for broad or 'what is / what types' questions.\n"
     "- Scope answers to exactly what is asked; for a specific question do not list the "
     "other options found in the context.\n"
     "- For cost/fee questions: give the main fee, then the always-applicable mandatory "
     "fees (Knowledge Dirham, Innovation Dirham, VAT) and an approximate total.\n"
-    "- Be concise: short sentences or bullet points. If the answer isn't in the knowledge "
+    "- Be concise: short sentences or bullet points in maximum 50 words. If the answer isn't in the knowledge "
     "base, say so. If the question is unrelated to UAE visas, say so without retrieving.\n\n"
     "PERSONAL DETAILS & ELIGIBILITY:\n"
     "- When the user shares personal details relevant to eligibility (nationality, age, "
@@ -237,7 +231,8 @@ BASE_SYSTEM_PROMPT = (
     "requirements, THEN compare them against the user's KNOWN PROFILE below.\n"
     "- If a required detail is missing from the profile, ASK the user for that specific "
     "detail instead of guessing. When they answer, save it and continue.\n"
-    "- Give a clear verdict: which requirements are met, which are not, and the bottom line."
+    "- Give a clear verdict: which requirements are met, which are not, and the bottom line.\n"
+
 )
 
 
@@ -253,34 +248,25 @@ def system_prompt_with_profile(request) -> str:
     return f"{BASE_SYSTEM_PROMPT}\n\nKNOWN USER PROFILE:\n{profile_text}"
 
 
-# ======================================================================
-# The agent: tools + middleware (PII, summarization, profile) + memory
-# ======================================================================
-checkpointer = InMemorySaver()  # conversation memory (per thread)
+checkpointer = InMemorySaver()  # short term memory
 
 agent = create_agent(
     llm,
     tools=[retrieve, save_user_profile],
     middleware=[
-        # 1) PII: redact sensitive identifiers in user input so they never land
-        #    in conversation history or logs. (Eligibility fields like nationality
-        #    or deposit amount are NOT redacted - only emails / card numbers.)
         PIIMiddleware("email", strategy="redact"),
         PIIMiddleware("credit_card", strategy="redact"),
-        # 2) Summarization: when the thread grows past ~16k tokens, summarize the
-        #    older messages and keep the last 12 so we stay under qwen3's window.
         SummarizationMiddleware(
             model=llm,
             trigger=("tokens", 16000),
             keep=("messages", 12),
         ),
-        # 3) Profile injection: puts the saved personal details into the prompt.
         system_prompt_with_profile,
     ],
     checkpointer=checkpointer,
 )
 
-# Single local user -> one persistent conversation thread.
+# one thread for now
 THREAD_ID = "local-user"
 AGENT_CONFIG = {"configurable": {"thread_id": THREAD_ID}}
 
@@ -322,7 +308,7 @@ def chat(q: Query):
             {"messages": [{"role": "user", "content": q.question}]},
             config=AGENT_CONFIG,
         )
-        logger.info("Finished processing chat request for question")
+        logger.info(f"Finished processing chat request for question, response: {result['messages'][-1].content}")
         return {"answer": result["messages"][-1].content}
     except Exception as e:
         logger.error(f"Error processing chat request: {e}")
@@ -336,11 +322,6 @@ def chat_stream(q: Query):
         req_start = time.perf_counter()
         first_token_logged = False
         try:
-            # stream_mode="messages" yields (token, metadata) for every LLM call.
-            # The agent's final answer comes from the "model" node. Tool-deciding
-            # passes emit empty content (skipped by the token.content check), and
-            # the summarization model runs in its own node (excluded by name), so
-            # neither leaks into the streamed answer.
             for token, metadata in agent.stream(
                 {"messages": [{"role": "user", "content": q.question}]},
                 stream_mode="messages",
