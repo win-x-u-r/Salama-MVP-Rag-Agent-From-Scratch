@@ -108,3 +108,4 @@ win32_setctime==1.2.0
 xxhash==3.7.0
 yarl==1.24.2
 zstandard==0.25.0
+neo4j==6.2.0

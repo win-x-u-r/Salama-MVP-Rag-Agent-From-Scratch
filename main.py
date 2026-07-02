@@ -93,8 +93,28 @@ embeddings = OpenAIEmbeddings(
     # }
 )# some workaround to route the openai embedding model through openrouter
 
+# ======================================================================
+# Retrieval backend: "qdrant" (vector-only) or "graph" (Neo4j hybrid).
+# Set RETRIEVER_BACKEND in .env to switch. Defaults to qdrant.
+# ======================================================================
+RETRIEVER_BACKEND = os.getenv("RETRIEVER_BACKEND", "qdrant").lower()
+
+graph_retriever = None
+if RETRIEVER_BACKEND == "graph":
+    try:
+        logger.info("setting up Neo4j graph retriever")
+        from graph_retriever import GraphRetriever
+
+        graph_retriever = GraphRetriever(embeddings)
+        logger.info("Neo4j graph retriever ready.")
+    except Exception as e:
+        logger.error(f"Error setting up Neo4j graph retriever: {e}")
+
 #Qdrant setup
+qdrant = None
 try:
+    if RETRIEVER_BACKEND == "graph":
+        raise RuntimeError("skipped (RETRIEVER_BACKEND=graph)")
     # use existing collection:
     logger.info("setting up Qdrant client")
     qdrant = QdrantVectorStore.from_existing_collection(
@@ -145,18 +165,18 @@ def retrieve(query: str, k: int = 3) -> str:
         requested_k = k
         k = max(1, min(k, 10))  # clamp so the model can't ask for too few/many
         clamp_note = "" if k == requested_k else f" (clamped from {requested_k})"
-        logger.info(f"Retrieving documents for query: {query} | k={k}{clamp_note}")
-        t0 = time.perf_counter()
-        query_vector = embeddings.embed_query(query)
-        t_embed = time.perf_counter() - t0
-        t1 = time.perf_counter()
-        docs = qdrant.similarity_search_by_vector(query_vector, k=k)
-        t_search = time.perf_counter() - t1
-        results = "\n\n".join(d.page_content for d in docs)
         logger.info(
-            f"[timing] retrieve: embed={t_embed:.2f}s search={t_search:.2f}s "
-            f"total={t_embed + t_search:.2f}s"
+            f"Retrieving documents for query: {query} | k={k}{clamp_note} "
+            f"| backend={RETRIEVER_BACKEND}"
         )
+        t0 = time.perf_counter()
+        if RETRIEVER_BACKEND == "graph" and graph_retriever is not None:
+            results = graph_retriever.retrieve(query, k=k)
+        else:
+            query_vector = embeddings.embed_query(query)
+            docs = qdrant.similarity_search_by_vector(query_vector, k=k)
+            results = "\n\n".join(d.page_content for d in docs)
+        logger.info(f"[timing] retrieve total={time.perf_counter() - t0:.2f}s")
         logger.info(f"Documents retrieved successfully: {results}")
         return results
     except Exception as e:
