@@ -55,7 +55,7 @@ VECTOR_INDEX = "service_embedding"
 def build_search_text(rec: dict) -> str:
     parts = [
         f"Service: {rec['name']}",
-        f"Category: {rec['category']} | Group: {rec['group']}",
+        f"Category: {rec['category']} | Group: {rec['group'] or '(none)'}",
         f"Action: {rec['action']} | Permit type: {rec['permitType']}",
         f"Description: {rec['description']}",
         f"Audience: {rec['audience']}",
@@ -172,8 +172,10 @@ SET svc.name = s.name, svc.url = s.url, svc.description = s.description,
     svc.searchText = s.searchText
 MERGE (cat:Category {name: s.category})
 MERGE (svc)-[:IN_CATEGORY]->(cat)
-MERGE (grp:Group {name: s.group})
-MERGE (svc)-[:IN_GROUP]->(grp)
+WITH svc, s
+FOREACH (gname IN CASE WHEN s.group IS NULL THEN [] ELSE [s.group] END |
+    MERGE (grp:Group {name: gname})
+    MERGE (svc)-[:IN_GROUP]->(grp))
 WITH svc, s
 FOREACH (ch IN s.channels |
     MERGE (c:Channel {name: ch})
