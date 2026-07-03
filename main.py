@@ -17,14 +17,11 @@ from langchain_openai import ChatOpenAI
 from langchain_openrouter import ChatOpenRouter
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# --- new agent stack (LangChain v1 create_agent + middleware) ---
-from langchain.agents import create_agent
-from langchain.agents.middleware import (
-    PIIMiddleware,
-    SummarizationMiddleware,
-    dynamic_prompt,
-)
+# --- LangGraph agent graph + short-term (conversation) memory ---
+from langgraph.graph import START, END, MessagesState, StateGraph
+from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.checkpoint.memory import InMemorySaver
+from langchain_core.messages import SystemMessage
 
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
@@ -230,6 +227,24 @@ def save_user_profile(updates: dict) -> str:
         return "Could not save the profile."
 
 
+@tool
+def clear_user_profile() -> str:
+    """Erase ALL saved personal details about the user.
+
+    Call this only when the user explicitly asks to clear, delete, reset, or
+    forget their stored information (e.g. "forget my details", "delete my data").
+    This cannot be undone.
+    """
+    try:
+        if os.path.exists(PROFILE_PATH):
+            os.remove(PROFILE_PATH)
+        logger.info("[profile] cleared by user request")
+        return "Done. All saved personal details have been erased."
+    except Exception as e:
+        logger.error(f"Error clearing user profile: {e}")
+        return "Could not clear the profile."
+
+
 # inject user profile in system prompt
 BASE_SYSTEM_PROMPT = (
     "You are the GDRFA Dubai visa assistant. You answer questions about UAE visa and "
@@ -256,9 +271,8 @@ BASE_SYSTEM_PROMPT = (
 )
 
 
-@dynamic_prompt
-def system_prompt_with_profile(request) -> str:
-    """Inject the live user profile into the system prompt on every turn."""
+def build_system_prompt() -> str:
+    """Base instructions + the live user profile, injected on every turn."""
     profile = load_profile()
     profile_text = (
         json.dumps(profile, ensure_ascii=False, indent=2)
@@ -268,27 +282,44 @@ def system_prompt_with_profile(request) -> str:
     return f"{BASE_SYSTEM_PROMPT}\n\nKNOWN USER PROFILE:\n{profile_text}"
 
 
-checkpointer = InMemorySaver()  # short term memory
+# ======================================================================
+# The LangGraph agent graph (ReAct loop): agent <-> tools
+#
+#   START -> agent -> (tools_condition) -> tools -> agent -> ... -> END
+#
+# The single "agent" node both decides to call a tool and writes the final
+# answer once tool results come back. The profile is injected fresh into the
+# system prompt each turn; it is NOT stored in state, so it never goes stale.
+# ======================================================================
+TOOLS = [retrieve, save_user_profile, clear_user_profile]
 
-agent = create_agent(
-    llm,
-    tools=[retrieve, save_user_profile],
-    middleware=[
-        PIIMiddleware("email", strategy="redact"),
-        PIIMiddleware("credit_card", strategy="redact"),
-        SummarizationMiddleware(
-            model=llm,
-            trigger=("tokens", 16000),
-            keep=("messages", 12),
-        ),
-        system_prompt_with_profile,
-    ],
-    checkpointer=checkpointer,
-)
 
-# one thread for now
+def agent_node(state: MessagesState):
+    """Call the LLM with the tools + a freshly-built (profile-aware) system prompt."""
+    try:
+        t0 = time.perf_counter()
+        system = SystemMessage(content=build_system_prompt())
+        response = llm.bind_tools(TOOLS).invoke([system] + state["messages"])
+        logger.info(f"[timing] agent node (LLM): {time.perf_counter() - t0:.2f}s")
+        return {"messages": [response]}
+    except Exception as e:
+        logger.error(f"Error in agent node: {e}")
+        return {"messages": [{"role": "assistant", "content": "An error occurred while processing your request."}]}
+
+
+builder = StateGraph(MessagesState)
+builder.add_node("agent", agent_node)
+builder.add_node("tools", ToolNode(TOOLS))
+builder.add_edge(START, "agent")
+builder.add_conditional_edges("agent", tools_condition)  # -> "tools" if a tool was called, else END
+builder.add_edge("tools", "agent")
+
+checkpointer = InMemorySaver()  # short-term (conversation) memory, per thread
+graph = builder.compile(checkpointer=checkpointer)
+
+# Single local user -> one persistent conversation thread.
 THREAD_ID = "local-user"
-AGENT_CONFIG = {"configurable": {"thread_id": THREAD_ID}}
+GRAPH_CONFIG = {"configurable": {"thread_id": THREAD_ID}}
 
 
 #fastapi stuff
@@ -324,9 +355,9 @@ def reset_profile():
 def chat(q: Query):
     try:
         logger.info("Processing chat request for question")
-        result = agent.invoke(
+        result = graph.invoke(
             {"messages": [{"role": "user", "content": q.question}]},
-            config=AGENT_CONFIG,
+            config=GRAPH_CONFIG,
         )
         logger.info(f"Finished processing chat request for question, response: {result['messages'][-1].content}")
         return {"answer": result["messages"][-1].content}
@@ -342,12 +373,12 @@ def chat_stream(q: Query):
         req_start = time.perf_counter()
         first_token_logged = False
         try:
-            for token, metadata in agent.stream(
+            for token, metadata in graph.stream(
                 {"messages": [{"role": "user", "content": q.question}]},
                 stream_mode="messages",
-                config=AGENT_CONFIG,
+                config=GRAPH_CONFIG,
             ):
-                if metadata.get("langgraph_node") == "model" and token.content:
+                if metadata.get("langgraph_node") == "agent" and token.content:
                     if not first_token_logged:
                         logger.info(f"[timing] time-to-first-token: {time.perf_counter() - req_start:.2f}s")
                         first_token_logged = True
