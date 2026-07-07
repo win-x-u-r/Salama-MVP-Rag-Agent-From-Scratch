@@ -17,6 +17,11 @@ import logging
 import os
 
 from neo4j import GraphDatabase
+from langchain_core.retrievers import BaseRetriever
+from langchain_core.documents import Document
+from langchain_core.callbacks import CallbackManagerForRetrieverRun
+from pydantic import PrivateAttr
+
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -54,28 +59,78 @@ ORDER BY score DESC
 """
 
 
-class GraphRetriever:
-    def __init__(self, embeddings):
-        self.embeddings = embeddings
+# class GraphRetriever:
+#     def __init__(self, embeddings):
+#         self.embeddings = embeddings
+#         uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+#         auth = (os.getenv("NEO4J_USERNAME", "neo4j"), os.getenv("NEO4J_PASSWORD", ""))
+#         self.database = os.getenv("NEO4J_DATABASE", "neo4j")
+#         self.driver = GraphDatabase.driver(uri, auth=auth)
+#         self.driver.verify_connectivity()
+#         logger.info(f"GraphRetriever connected to Neo4j at {uri}")
+
+#     def close(self):
+#         self.driver.close()
+
+#     def retrieve(self, query: str, k: int = 3) -> str:
+#         query_vector = self.embeddings.embed_query(query)
+#         with self.driver.session(database=self.database) as session:
+#             rows = session.run(
+#                 RETRIEVAL_QUERY, index=VECTOR_INDEX, k=k, embedding=query_vector
+#             ).data()
+#         if not rows:
+#             return "No matching services found in the knowledge graph."
+#         return "\n\n---\n\n".join(self._format(row) for row in rows)
+
+class GraphRetriever(BaseRetriever):
+    """Neo4j hybrid retriever that returns one Document per matched service."""
+
+    k: int = 25  # candidate pool: how many service nodes the vector index returns
+
+    _embeddings: object = PrivateAttr()
+    _driver: object = PrivateAttr()
+    _database: str = PrivateAttr()
+
+    def __init__(self, embeddings, k: int = 25, **kwargs):
+        super().__init__(k=k, **kwargs)
         uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
         auth = (os.getenv("NEO4J_USERNAME", "neo4j"), os.getenv("NEO4J_PASSWORD", ""))
-        self.database = os.getenv("NEO4J_DATABASE", "neo4j")
-        self.driver = GraphDatabase.driver(uri, auth=auth)
-        self.driver.verify_connectivity()
+        self._database = os.getenv("NEO4J_DATABASE", "neo4j")
+        self._embeddings = embeddings
+        self._driver = GraphDatabase.driver(uri, auth=auth)
+        self._driver.verify_connectivity()
         logger.info(f"GraphRetriever connected to Neo4j at {uri}")
 
     def close(self):
-        self.driver.close()
+        self._driver.close()
 
-    def retrieve(self, query: str, k: int = 3) -> str:
-        query_vector = self.embeddings.embed_query(query)
-        with self.driver.session(database=self.database) as session:
+    # NEW: the LangChain retriever interface — returns Documents (one per service block)
+    def _get_relevant_documents(
+        self, query: str, *, run_manager: CallbackManagerForRetrieverRun
+    ) -> list[Document]:
+        query_vector = self._embeddings.embed_query(query)
+        with self._driver.session(database=self._database) as session:
             rows = session.run(
-                RETRIEVAL_QUERY, index=VECTOR_INDEX, k=k, embedding=query_vector
+                RETRIEVAL_QUERY, index=VECTOR_INDEX, k=self.k, embedding=query_vector
             ).data()
-        if not rows:
+        return [
+            Document(
+                page_content=self._format(row),
+                metadata={"name": row["name"], "score": row["score"]},
+            )
+            for row in rows
+        ]
+
+    # BACKWARD-COMPAT: keeps your current tool (graph_retriever.retrieve(query, k=...)) working.
+    # Remove this once the tool switches to the reranker/compression path.
+    def retrieve(self, query: str, k: int | None = None) -> str:
+        if k is not None:
+            self.k = k
+        docs = self.invoke(query)
+        if not docs:
             return "No matching services found in the knowledge graph."
-        return "\n\n---\n\n".join(self._format(row) for row in rows)
+        return "\n\n---\n\n".join(d.page_content for d in docs)
+
 
     @staticmethod
     def _format(row: dict) -> str:
