@@ -4,8 +4,10 @@ import logging
 import time
 
 from langchain_core.tools import tool
-
+from langchain_classic.retrievers import ContextualCompressionRetriever
+from .reranker import FastEmbedRerank
 from .backend_setup import RETRIEVER_BACKEND, graph_retriever, embeddings, qdrant
+from .config import RETRIEVAL_K, RERANKER_TOP_N
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -23,16 +25,29 @@ def retrieve(query: str) -> str:
             f"| backend={RETRIEVER_BACKEND}"
         )
         t0 = time.perf_counter()
-        k=10
+        k = RETRIEVAL_K
+        topN = RERANKER_TOP_N
         if RETRIEVER_BACKEND == "graph" and graph_retriever is not None:
-            results = graph_retriever.retrieve(query, k=k)
+            graph_retriever.k = k
+            base = graph_retriever
         else:
-            query_vector = embeddings.embed_query(query)
-            docs = qdrant.similarity_search_by_vector(query_vector, k=k)
-            results = "\n\n".join(d.page_content for d in docs)
-        logger.info(f"[timing] retrieve total={time.perf_counter() - t0:.2f}s")
-        logger.info(f"Documents retrieved successfully: {results}")
-        return results
+            base = qdrant.as_retriever(search_kwargs={"k": k})
+            # query_vector = embeddings.embed_query(query)
+            # docs = qdrant.similarity_search_by_vector(query_vector, k=k)
+            # results = "\n\n".join(d.page_content for d in docs)
+
+        # retriever = ContextualCompressionRetriever(
+        #     base_compressor=FastEmbedRerank(top_n=topN),
+        #     base_retriever=base,
+        # )
+
+        retrieved_docs = base.invoke(query)
+        logger.info(f"Retrieved {len(retrieved_docs)} documents for query: {query}")
+        compressed_docs = FastEmbedRerank(top_n=RERANKER_TOP_N).compress_documents(retrieved_docs, query)
+        logger.info(f"Compressed to {len(compressed_docs)} documents for query: {query}")
+        logger.info(f"[timing] retrieve and compress total={time.perf_counter() - t0:.2f}s")
+        logger.info(f"Documents retrieved and compressed successfully with k={k} and top_n={topN}: {[d.page_content for d in compressed_docs]}")
+        return [d.page_content for d in compressed_docs]
     except Exception as e:
         logger.error(f"Error retrieving documents: {e}")
         return "An error occurred while retrieving documents."
