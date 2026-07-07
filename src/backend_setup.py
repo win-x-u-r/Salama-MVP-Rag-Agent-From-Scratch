@@ -31,7 +31,7 @@ try:
 except Exception as e:
     logger.error(f"Error initializing LLM: {e}")
 
-#retriever
+# old retriever that used to be with fast embed and in memory vector store
 # try:
 #     logger.info("Initializing retriever...")
 #     retriever = InMemoryVectorStore.from_documents(
@@ -47,10 +47,6 @@ embeddings = OpenAIEmbeddings(
     model="openai/text-embedding-3-large",
     openai_api_base="https://openrouter.ai/api/v1",
     openai_api_key=os.getenv("OPENROUTER_API_KEY"),
-    # default_headers={
-    #     "HTTP-Referer": "http://localhost:8000", # OpenRouter requires a referer
-    #     "X-Title": "Agentic RAG App"
-    # }
 )# some workaround to route the openai embedding model through openrouter
 
 RETRIEVER_BACKEND = os.getenv("RETRIEVER_BACKEND", "qdrant").lower()
