@@ -55,12 +55,12 @@ def responder_agent(state:MessagesState):
 builder = StateGraph(MessagesState)
 builder.add_node("retrieve agent", retrieve_agent)
 builder.add_node("responder agent", responder_agent)
-builder.add_node("tools", ToolNode(TOOLS))
+builder.add_node("retriever", ToolNode(TOOLS))
 builder.add_edge(START, "retrieve agent")
 # builder.add_conditional_edges("agent", tools_condition)  # -> "tools" if a tool was called, else END
 # builder.add_conditional_edges("retrieve agent", check_for_tools,{"tools": "tools", "responder": "responder agent"})  # -> "tools" if a tool was called, else END
-builder.add_edge("retrieve agent", "tools")
-builder.add_edge("tools", "responder agent")
+builder.add_edge("retrieve agent", "retriever")
+builder.add_edge("retriever", "responder agent")
 builder.add_edge("responder agent", END)
 
 checkpointer = InMemorySaver()  # short-term (conversation) memory, per thread
