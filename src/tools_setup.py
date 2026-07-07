@@ -11,26 +11,19 @@ logger = logging.getLogger("uvicorn.error")
 
 #retrieving tool
 @tool
-def retrieve(query: str, k: int = 3) -> str:
+def retrieve(query: str) -> str:
     """Search the knowledge base and return relevant passages.
 
     Args:
-        query: What to search for.
-        k: How many passages to return. Use a LARGER value (6-10) for broad,
-           definitional, or "list all"-style questions (e.g. "what is the golden
-           visa", "what visa types exist") since the answer may span several
-           services. Use a SMALL value (2-4) for narrow factual lookups
-           (a single fee, date, GPA, or document requirement).
+        query (str): The user's question or query.
     """
     try:
-        requested_k = k
-        k = max(1, min(k, 10))  # clamp so the model can't ask for too few/many
-        clamp_note = "" if k == requested_k else f" (clamped from {requested_k})"
         logger.info(
-            f"Retrieving documents for query: {query} | k={k}{clamp_note} "
+            f"Retrieving documents for query: {query}"
             f"| backend={RETRIEVER_BACKEND}"
         )
         t0 = time.perf_counter()
+        k=10
         if RETRIEVER_BACKEND == "graph" and graph_retriever is not None:
             results = graph_retriever.retrieve(query, k=k)
         else:
