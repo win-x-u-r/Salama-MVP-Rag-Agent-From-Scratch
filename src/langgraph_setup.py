@@ -132,7 +132,7 @@ def responder_agent(state: ClarifierState):
         response = llm.invoke(payload)
         logger.info(
             f"[timing] responder node: {time.perf_counter() - t0:.2f}s | mode={mode} "
-            f"| tokens: {tokens}\n response: {response.content}"
+            f"| tokens: {tokens}\n"
         )
         return {"messages": [response]}
     except Exception as e:

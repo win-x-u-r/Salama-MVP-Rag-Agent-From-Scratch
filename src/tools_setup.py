@@ -46,7 +46,7 @@ def retrieve(query: str) -> str:
         compressed_docs = FastEmbedRerank(top_n=RERANKER_TOP_N).compress_documents(retrieved_docs, query)
         logger.info(f"Compressed to {len(compressed_docs)} documents for query: {query}")
         logger.info(f"[timing] retrieve and compress total={time.perf_counter() - t0:.2f}s")
-        logger.info(f"Documents retrieved and compressed successfully with k={k} and top_n={topN}: {[d.page_content for d in compressed_docs]}")
+        logger.info(f"Documents retrieved and compressed successfully with k={k} and top_n={topN}")
         return [d.page_content for d in compressed_docs]
     except Exception as e:
         logger.error(f"Error retrieving documents: {e}")
