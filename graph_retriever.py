@@ -12,7 +12,6 @@ This gives vector-search recall plus graph-structured, complete answers:
 a service hit always comes back with ALL of its fees and conditions, not
 just whichever chunk happened to match.
 """
-
 import logging
 import os
 
@@ -21,6 +20,7 @@ from langchain_core.retrievers import BaseRetriever
 from langchain_core.documents import Document
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from pydantic import PrivateAttr
+from src.config import RETRIEVAL_K
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -85,13 +85,13 @@ ORDER BY score DESC
 class GraphRetriever(BaseRetriever):
     """Neo4j hybrid retriever that returns one Document per matched service."""
 
-    k: int = 25  # candidate pool: how many service nodes the vector index returns
+    k: int = RETRIEVAL_K
 
     _embeddings: object = PrivateAttr()
     _driver: object = PrivateAttr()
     _database: str = PrivateAttr()
 
-    def __init__(self, embeddings, k: int = 25, **kwargs):
+    def __init__(self, embeddings, k: int=RETRIEVAL_K, **kwargs):
         super().__init__(k=k, **kwargs)
         uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
         auth = (os.getenv("NEO4J_USERNAME", "neo4j"), os.getenv("NEO4J_PASSWORD", ""))
