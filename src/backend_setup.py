@@ -26,6 +26,7 @@ try:
         reasoning={"effort": "none"},  # disable chain-of-thought reasoning for faster responses
         openrouter_provider={"sort": "throughput"}, # prefer the fastest qwen3 provider
         seed=42,  # the answer of life
+        disable_streaming="tool_calling" # this apparently fixes the tool call being called with every chunk 
     )
     logger.info("LLM initialized successfully.")
 except Exception as e:

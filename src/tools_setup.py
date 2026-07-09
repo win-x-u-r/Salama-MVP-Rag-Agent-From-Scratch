@@ -24,7 +24,6 @@ def retrieve(query: str) -> str:
             f"Retrieving documents for query: {query}"
             f"| backend={RETRIEVER_BACKEND}"
         )
-        t0 = time.perf_counter()
         k = RETRIEVAL_K
         topN = RERANKER_TOP_N
         if RETRIEVER_BACKEND == "graph" and graph_retriever is not None:
@@ -41,10 +40,11 @@ def retrieve(query: str) -> str:
         #     base_retriever=base,
         # )
 
+        t0 = time.perf_counter()
         retrieved_docs = base.invoke(query)
-        logger.info(f"Retrieved {len(retrieved_docs)} documents for query: {query}")
+        logger.info(f"Retrieved {len(retrieved_docs)} documents for query: {query},\n [timing] Retrieval: {time.perf_counter()-t0:.2f}s")
         compressed_docs = FastEmbedRerank(top_n=RERANKER_TOP_N).compress_documents(retrieved_docs, query)
-        logger.info(f"Compressed to {len(compressed_docs)} documents for query: {query}")
+        logger.info(f"Compressed to {len(compressed_docs)} documents for query: {query},\n [timing] Reranking: {time.perf_counter()-t0:.2f}s")
         logger.info(f"[timing] retrieve and compress total={time.perf_counter() - t0:.2f}s")
         logger.info(f"Documents retrieved and compressed successfully with k={k} and top_n={topN}")
         return [d.page_content for d in compressed_docs]
