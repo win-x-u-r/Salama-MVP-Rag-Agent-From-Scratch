@@ -2,7 +2,9 @@ import os
 import logging
 import time
 
+from ag_ui_langgraph import LangGraphAgent, add_langgraph_fastapi_endpoint
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -13,10 +15,28 @@ logger = logging.getLogger("uvicorn.error")
 #fastapi stuff
 app = FastAPI(title="Agentic RAG")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# AG-UI protocol endpoint: streams the run as AG-UI events (SSE) for the React client
+add_langgraph_fastapi_endpoint(
+    app=app,
+    agent=LangGraphAgent(
+        name="rag_agent",
+        description="Agentic RAG assistant for GDRFA Dubai visa services.",
+        graph=graph,
+    ),
+    path="/agui",
+)
+
 
 @app.get("/")
 def index():
-    return FileResponse(os.path.join(os.path.dirname(os.path.dirname(__file__)), "index.html"))
+    return FileResponse(os.path.join(os.path.dirname(__file__), "index.html"))
 
 
 class Query(BaseModel):
