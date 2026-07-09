@@ -1,5 +1,7 @@
 import os
 import logging
+import time
+
 from dotenv import load_dotenv
 
 from langchain_community.embeddings import OpenAIEmbeddings
@@ -56,10 +58,11 @@ graph_retriever = None
 if RETRIEVER_BACKEND == "graph":
     try:
         logger.info("setting up Neo4j graph retriever")
+        _t0 = time.perf_counter()
         from graph_retriever import GraphRetriever
 
         graph_retriever = GraphRetriever(embeddings)
-        logger.info("Neo4j graph retriever ready.")
+        logger.info(f"Neo4j graph retriever ready. [timing] setup: {time.perf_counter() - _t0:.2f}s")
     except Exception as e:
         logger.error(f"Error setting up Neo4j graph retriever: {e}")
 
@@ -69,12 +72,13 @@ if RETRIEVER_BACKEND == "qdrant":
     try:
         # use existing collection:
         logger.info("setting up Qdrant client")
+        _t0 = time.perf_counter()
         qdrant = QdrantVectorStore.from_existing_collection(
             embedding=embeddings,
             collection_name="rag_collection",
             path=("./qdrant_collection"),
         )
-        logger.info("qdrant succesfully setup")
+        logger.info(f"qdrant succesfully setup [timing] setup: {time.perf_counter() - _t0:.2f}s")
     except Exception as e:
         logger.error(f"error setting up qdrant: {e}")
 

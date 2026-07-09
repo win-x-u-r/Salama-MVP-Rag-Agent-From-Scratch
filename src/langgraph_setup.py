@@ -1,9 +1,10 @@
 import logging
 import time
 from typing import Literal
+from uuid import uuid4
 
 from pydantic import BaseModel, Field
-from langchain_core.messages import SystemMessage, AIMessage, HumanMessage
+from langchain_core.messages import SystemMessage, AIMessage, HumanMessage, ToolMessage
 from langgraph.graph import START, END, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 from langgraph.types import Command
@@ -11,7 +12,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from .backend_setup import llm
 from .tools_setup import TOOLS, retrieve
-from .system_prompt_setup import build_system_prompt
+from .system_prompt_setup import build_system_prompt, NO_THINK
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -58,6 +59,33 @@ def reset_turn(state: ClarifierState):
     return {"clarify_count": 0, "mode": "answer"}
 
 
+def first_retrieve(state: ClarifierState):
+    """First-pass retrieval without an LLM: search with the user's own words.
+
+    Saves the 1.5-4s query-writing LLM call on every turn; when the naive
+    query retrieves poorly, the clarifier's 'requery' loop brings the LLM
+    back in via `retrieve agent`.
+    """
+    question = ""
+    for msg in reversed(state["messages"]):
+        if isinstance(msg, HumanMessage):
+            question = str(msg.content)
+            break
+    return {
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "retrieve",
+                    "args": {"query": question},
+                    "id": f"first-retrieve-{uuid4().hex[:8]}",
+                    "type": "tool_call",
+                }],
+            )
+        ]
+    }
+
+
 def retrieve_agent(state: ClarifierState):
     """Forces a retrieval tool call so the pipeline always grounds its answer."""
     try:
@@ -71,6 +99,32 @@ def retrieve_agent(state: ClarifierState):
         return {"messages": [AIMessage(content="An error occurred while processing your request, retriever agent.")]}
 
 
+def _clarifier_view(state: ClarifierState) -> list:
+    """Compact clarifier input: question + search query + truncated passages.
+
+    Passing full history (with every past retrieval result) made the
+    clarifier's prompt grow each turn; it only needs this turn's evidence.
+    """
+    question, search_query, passages = "", "", ""
+    for msg in reversed(state["messages"]):
+        if not passages and isinstance(msg, ToolMessage):
+            passages = str(msg.content)[:2000]
+        elif not search_query and isinstance(msg, AIMessage) and msg.tool_calls:
+            search_query = msg.tool_calls[0]["args"].get("query", "")
+        elif isinstance(msg, HumanMessage):
+            question = str(msg.content)
+            break
+    return [
+        HumanMessage(
+            content=(
+                f"USER QUESTION: {question}\n\n"
+                f"SEARCH QUERY USED: {search_query}\n\n"
+                f"RETRIEVED PASSAGES (truncated):\n{passages}"
+            )
+        )
+    ]
+
+
 def clarifier_agent(state: ClarifierState) -> Command[Literal["retrieve agent", "responder agent"]]:
     """Judges the query/retrieval and routes: proceed, requery, or reprompt the user."""
     count = state.get("clarify_count", 0)
@@ -82,8 +136,8 @@ def clarifier_agent(state: ClarifierState) -> Command[Literal["retrieve agent", 
             logger.info(f"[clarifier] cap reached ({count}) -> proceed")
             return Command(goto="responder agent")
 
-        system = SystemMessage(content=CLARIFIER_PROMPT)
-        decision = llm.with_structured_output(ClarifierDecision).invoke([system] + state["messages"])
+        system = SystemMessage(content=CLARIFIER_PROMPT + NO_THINK)
+        decision = llm.with_structured_output(ClarifierDecision).invoke([system] + _clarifier_view(state))
         logger.info(
             f"[timing] clarifier node: {time.perf_counter() - t0:.2f}s "
             f"| action={decision.action} | count={count}"
@@ -128,11 +182,13 @@ def responder_agent(state: ClarifierState):
                 "get the missing detail (e.g. which visa type, their nationality, status, or assets)."
             )
         payload = [SystemMessage(content=prompt)] + state["messages"]
-        tokens = llm.get_num_tokens_from_messages(payload)
         response = llm.invoke(payload)
+        # token counts come free & exact from the provider's response;
+        # get_num_tokens_from_messages cost ~1.7s of GPT-2 tokenizing per turn
+        usage = getattr(response, "usage_metadata", None) or {}
         logger.info(
-            f"[timing] responder node: {time.perf_counter() - t0:.2f}s | mode={mode} "
-            f"| tokens: {tokens}\n"
+            f"[timing] responder node: LLM={time.perf_counter() - t0:.2f}s | mode={mode} "
+            f"| tokens: in={usage.get('input_tokens', '?')} out={usage.get('output_tokens', '?')}\n"
         )
         return {"messages": [response]}
     except Exception as e:
@@ -142,14 +198,16 @@ def responder_agent(state: ClarifierState):
 
 builder = StateGraph(ClarifierState)
 builder.add_node("reset", reset_turn)
+builder.add_node("first retrieve", first_retrieve)
 builder.add_node("retrieve agent", retrieve_agent)
 builder.add_node("retriever", ToolNode(TOOLS))
 builder.add_node("clarifier", clarifier_agent)
 builder.add_node("responder agent", responder_agent)
 
 builder.add_edge(START, "reset")
-builder.add_edge("reset", "retrieve agent")
-builder.add_edge("retrieve agent", "retriever")
+builder.add_edge("reset", "first retrieve")       # first pass: no LLM
+builder.add_edge("first retrieve", "retriever")
+builder.add_edge("retrieve agent", "retriever")   # requery path keeps the LLM
 builder.add_edge("retriever", "clarifier")
 # "clarifier" routes itself via Command(goto=...) -> "retrieve agent" (requery) or "responder agent"
 builder.add_edge("responder agent", END)

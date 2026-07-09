@@ -1,4 +1,6 @@
 import logging
+import time
+
 from fastembed.rerank.cross_encoder import TextCrossEncoder
 from langchain_core.documents.compressor import BaseDocumentCompressor
 
@@ -9,8 +11,9 @@ RERANK_MODEL = "jinaai/jina-reranker-v2-base-multilingual"  # 1k context
 try:
     # logger.info(TextCrossEncoder.list_supported_models())
     logger.info(f"Loading reranker: {RERANK_MODEL}")
+    _t0 = time.perf_counter()
     _reranker = TextCrossEncoder(model_name=RERANK_MODEL)
-    logger.info("Reranker ready.")
+    logger.info(f"Reranker ready. [timing] load: {time.perf_counter() - _t0:.2f}s")
 except Exception as e:
     logger.error(f"Error loading reranker: {e}")
     _reranker = None

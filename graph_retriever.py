@@ -14,6 +14,7 @@ just whichever chunk happened to match.
 """
 import logging
 import os
+import time
 
 from neo4j import GraphDatabase
 from langchain_core.retrievers import BaseRetriever
@@ -90,6 +91,7 @@ class GraphRetriever(BaseRetriever):
     _embeddings: object = PrivateAttr()
     _driver: object = PrivateAttr()
     _database: str = PrivateAttr()
+    _embed_cache: dict = PrivateAttr(default_factory=dict)
 
     def __init__(self, embeddings, k: int=RETRIEVAL_K, **kwargs):
         super().__init__(k=k, **kwargs)
@@ -108,11 +110,23 @@ class GraphRetriever(BaseRetriever):
     def _get_relevant_documents(
         self, query: str, *, run_manager: CallbackManagerForRetrieverRun
     ) -> list[Document]:
-        query_vector = self._embeddings.embed_query(query)
+        t0 = time.perf_counter()
+        query_vector = self._embed_cache.get(query)
+        if query_vector is None:
+            query_vector = self._embeddings.embed_query(query)
+            if len(self._embed_cache) >= 128:
+                self._embed_cache.clear()
+            self._embed_cache[query] = query_vector
+        t_embed = time.perf_counter() - t0
+        t1 = time.perf_counter()
         with self._driver.session(database=self._database) as session:
             rows = session.run(
                 RETRIEVAL_QUERY, index=VECTOR_INDEX, k=self.k, embedding=query_vector
             ).data()
+        logger.info(
+            f"[timing] graph retriever: embed={t_embed:.2f}s "
+            f"| neo4j={time.perf_counter() - t1:.2f}s"
+        )
         return [
             Document(
                 page_content=self._format(row),

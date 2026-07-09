@@ -1,6 +1,13 @@
 import json
+import os
 
 from .tools_setup import load_profile
+
+# Qwen3 soft switch: "/no_think" in the prompt disables the thinking preamble,
+# which otherwise delays the first answer token. Empty for non-Qwen3 models.
+NO_THINK = (
+    "\n/no_think" if "qwen3" in os.getenv("OPENROUTER_MODEL", "").lower() else ""
+)
 
 # inject user profile in system prompt
 BASE_SYSTEM_PROMPT = (
@@ -37,4 +44,4 @@ def build_system_prompt() -> str:
         if profile
         else "(no personal details saved yet)"
     )
-    return f"{BASE_SYSTEM_PROMPT}\n\nKNOWN USER PROFILE:\n{profile_text}"
+    return f"{BASE_SYSTEM_PROMPT}\n\nKNOWN USER PROFILE:\n{profile_text}{NO_THINK}"

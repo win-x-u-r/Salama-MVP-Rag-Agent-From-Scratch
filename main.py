@@ -105,10 +105,12 @@ def reset_profile():
 def chat(q: Query):
     try:
         logger.info("Processing chat request for question")
+        t0 = time.perf_counter()
         result = graph.invoke(
             {"messages": [{"role": "user", "content": q.question}]},
             config=GRAPH_CONFIG,
         )
+        logger.info(f"[timing] /chat total: {time.perf_counter() - t0:.2f}s")
         logger.info(f"Finished processing chat request for question, response: {result['messages'][-1].content}")
         return {"answer": result["messages"][-1].content}
     except Exception as e:
