@@ -43,9 +43,9 @@ def retrieve(query: str) -> str:
         t0 = time.perf_counter()
         retrieved_docs = base.invoke(query)
         logger.info(f"Retrieved {len(retrieved_docs)} documents for query: {query},\n [timing] Retrieval: {time.perf_counter()-t0:.2f}s")
+        t0 = time.perf_counter()
         compressed_docs = FastEmbedRerank(top_n=RERANKER_TOP_N).compress_documents(retrieved_docs, query)
         logger.info(f"Compressed to {len(compressed_docs)} documents for query: {query},\n [timing] Reranking: {time.perf_counter()-t0:.2f}s")
-        logger.info(f"[timing] retrieve and compress total={time.perf_counter() - t0:.2f}s")
         logger.info(f"Documents retrieved and compressed successfully with k={k} and top_n={topN}")
         return [d.page_content for d in compressed_docs]
     except Exception as e:

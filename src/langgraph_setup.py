@@ -10,7 +10,7 @@ from langgraph.types import Command
 from langgraph.checkpoint.memory import InMemorySaver
 
 from .backend_setup import llm
-from .tools_setup import TOOLS
+from .tools_setup import TOOLS, retrieve
 from .system_prompt_setup import build_system_prompt
 
 logger = logging.getLogger("uvicorn.error")
@@ -63,7 +63,7 @@ def retrieve_agent(state: ClarifierState):
     try:
         t0 = time.perf_counter()
         system = SystemMessage(content=build_system_prompt())
-        response = llm.bind_tools(TOOLS, tool_choice="any").invoke([system] + state["messages"])
+        response = llm.bind_tools([retrieve], tool_choice="retrieve").invoke([system] + state["messages"])
         logger.info(f"[timing] retrieve agent (LLM): {time.perf_counter() - t0:.2f}s")
         return {"messages": [response]}
     except Exception as e:

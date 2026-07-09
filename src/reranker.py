@@ -4,8 +4,8 @@ from langchain_core.documents.compressor import BaseDocumentCompressor
 
 logger = logging.getLogger("uvicorn.error")
 
-# RERANK_MODEL = "jinaai/jina-reranker-v2-base-multilingual"  # 1k context
-RERANK_MODEL = "jinaai/jina-reranker-v1-turbo-en"
+RERANK_MODEL = "jinaai/jina-reranker-v2-base-multilingual"  # 1k context
+# RERANK_MODEL = "jinaai/jina-reranker-v1-turbo-en"
 try:
     # logger.info(TextCrossEncoder.list_supported_models())
     logger.info(f"Loading reranker: {RERANK_MODEL}")
@@ -25,7 +25,7 @@ class FastEmbedRerank(BaseDocumentCompressor):
         docs = list(documents)
         if not docs or _reranker is None:
             return docs[: self.top_n]                       # fall back to recall order
-        scores = list(_reranker.rerank(query, [d.page_content for d in docs]))  # score per doc
+        scores = list(_reranker.rerank(query, [d.page_content[:800] for d in docs]))  # score per doc
         order = sorted(range(len(docs)), key=lambda i: scores[i], reverse=True)
         return [docs[i] for i in order[: self.top_n]]
 
