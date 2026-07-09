@@ -261,6 +261,30 @@ button.stop {
   gap: 8px;
 }
 
+/* Bidi support: each block auto-detects its direction from its content,
+   so Arabic answers render right-to-left while English stays left-to-right. */
+.chat p,
+.chat h1,
+.chat h2,
+.chat h3,
+.chat h4,
+.chat h5,
+.chat h6,
+.chat li,
+.chat blockquote,
+.chat td,
+.chat th {
+  unicode-bidi: plaintext;
+  text-align: start;
+}
+
+/* Put list markers inline so bullets follow the text to the right in RTL. */
+.chat ul,
+.chat ol {
+  list-style-position: inside;
+  padding-inline-start: 1em;
+}
+
 .muted {
   color: var(--muted);
 }
