@@ -67,7 +67,8 @@ def chat_stream(q: Query):
                 {"messages": [{"role": "user", "content": q.question}]},
                 stream_mode="messages",
                 config=GRAPH_CONFIG,
-            ):
+                
+            ): 
                 if metadata.get("langgraph_node") == "responder agent" and token.content:
                     if not first_token_logged:
                         logger.info(f"[timing] time-to-first-token: {time.perf_counter() - req_start:.2f}s")

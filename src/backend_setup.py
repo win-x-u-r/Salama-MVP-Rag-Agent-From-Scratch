@@ -64,16 +64,18 @@ if RETRIEVER_BACKEND == "graph":
 
 #Qdrant setup
 qdrant = None
-try:
-    if RETRIEVER_BACKEND == "graph":
-        raise RuntimeError("skipped (RETRIEVER_BACKEND=graph)")
-    # use existing collection:
-    logger.info("setting up Qdrant client")
-    qdrant = QdrantVectorStore.from_existing_collection(
-        embedding=embeddings,
-        collection_name="rag_collection",
-        path=("./qdrant_collection"),
-    )
+if RETRIEVER_BACKEND == "qdrant":
+    try:
+        # use existing collection:
+        logger.info("setting up Qdrant client")
+        qdrant = QdrantVectorStore.from_existing_collection(
+            embedding=embeddings,
+            collection_name="rag_collection",
+            path=("./qdrant_collection"),
+        )
+        logger.info("qdrant succesfully setup")
+    except Exception as e:
+        logger.error(f"error setting up qdrant: {e}")
 
     # # make new collection:
     # logger.info("setting up Qdrant client")
@@ -95,6 +97,3 @@ try:
     # logger.info("adding documents to qdrant")
     # qdrant.add_documents(documents=chunked_documents, ids=uuids)
     # logger.info("Qdrant client and collection set up successfully.")
-
-except Exception as e:
-    logger.error(f"Error setting up Qdrant client and collection: {e}")

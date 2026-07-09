@@ -4,9 +4,10 @@ from langchain_core.documents.compressor import BaseDocumentCompressor
 
 logger = logging.getLogger("uvicorn.error")
 
-RERANK_MODEL = "jinaai/jina-reranker-v1-turbo-en"  # 8K context
-
+RERANK_MODEL = "jinaai/jina-reranker-v2-base-multilingual"  # 1k context
+# RERANK_MODEL = "jinaai/jina-reranker-v1-turbo-en"
 try:
+    # logger.info(TextCrossEncoder.list_supported_models())
     logger.info(f"Loading reranker: {RERANK_MODEL}")
     _reranker = TextCrossEncoder(model_name=RERANK_MODEL)
     logger.info("Reranker ready.")
