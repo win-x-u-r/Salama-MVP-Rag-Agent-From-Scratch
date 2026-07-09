@@ -4,10 +4,9 @@ import time
 
 from dotenv import load_dotenv
 
-from langchain_community.embeddings import OpenAIEmbeddings
 from langchain_community.embeddings import FastEmbedEmbeddings
 from langchain_core.vectorstores import InMemoryVectorStore
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_openrouter import ChatOpenRouter
 
 from langchain_qdrant import QdrantVectorStore
@@ -50,6 +49,9 @@ embeddings = OpenAIEmbeddings(
     model="openai/text-embedding-3-large",
     openai_api_base="https://openrouter.ai/api/v1",
     openai_api_key=os.getenv("OPENROUTER_API_KEY"),
+    # tiktoken doesn't know the OpenRouter-prefixed model name; without this it
+    # warns "model not found. Using cl100k_base" on every embed call
+    tiktoken_model_name="text-embedding-3-large",
 )# some workaround to route the openai embedding model through openrouter
 
 RETRIEVER_BACKEND = os.getenv("RETRIEVER_BACKEND", "qdrant").lower()
