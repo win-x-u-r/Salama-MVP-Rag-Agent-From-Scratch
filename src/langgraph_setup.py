@@ -61,11 +61,7 @@ def reset_turn(state: ClarifierState):
     return {"clarify_count": 0, "mode": "answer", "improved_query": ""}
 
 
-# Messages the responder answers directly — no knowledge-base search.
-# Three families: pure small talk, questions about the assistant itself, and
-# questions about the stored user profile (it's injected into the system
-# prompt already). Each pattern must match the WHOLE message and respect a
-# length cap, so any real content fails the match and retrieval runs.
+
 _PUNCT = r"[\s!.,؟?،]*"
 _SKIP_RETRIEVAL_PATTERNS = [
     # -- small talk / acknowledgements --
@@ -114,10 +110,7 @@ def _skip_retrieval(text: str) -> bool:
     )
 
 
-# ---- LLM router: does this message need a knowledge-base search? ----
-# The regex above is only the zero-latency fast path for dead-obvious cases;
-# everything else gets one small structured-output call. Biased to retrieve:
-# unclear cases and router errors both fall through to retrieval.
+
 class RouteDecision(BaseModel):
     needs_retrieval: bool = Field(
         description="true if answering requires searching the UAE visa/residency "
