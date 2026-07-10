@@ -14,6 +14,7 @@ just whichever chunk happened to match.
 """
 import logging
 import os
+import re
 import time
 
 from neo4j import GraphDatabase
@@ -147,6 +148,59 @@ class GraphRetriever(BaseRetriever):
 
 
     @staticmethod
+    def _fee_totals(fees: list[dict]) -> list[str]:
+        """Pre-computed totals so the LLM never does fee arithmetic.
+
+        Buckets: refundable deposits stay out of totals; in-country fees are an
+        add-on; 'optional' fees are listed, not summed; fees named per duration
+        ('30-day ...', '60-day ...') are ALTERNATIVES — one total per duration.
+        """
+        variants: dict[str, float] = {}
+        common = in_ctry = refundable = 0.0
+        variable, optional = [], []
+        for f in fees:
+            amt = f.get("amount")
+            name = f.get("name") or ""
+            ftype = f.get("feeType") or ""
+            when = f.get("appliesWhen")
+            if amt is None:
+                variable.append(name)
+            elif "deposit" in ftype or "guarantee" in ftype:
+                refundable += amt
+            elif when == "in_country":
+                in_ctry += amt
+            elif when == "optional":
+                optional.append(f"{name} ({amt:g} AED)")
+            else:
+                m = re.search(r"(\d+)[- ]?day", name.lower())
+                if m:
+                    variants[m.group(1)] = variants.get(m.group(1), 0.0) + amt
+                else:
+                    common += amt
+
+        def fmt(total: float) -> str:
+            if in_ctry:
+                return f"{total:g} AED outside UAE / {total + in_ctry:g} AED inside UAE"
+            return f"{total:g} AED"
+
+        out = ["COMPUTED TOTALS (pre-calculated — use verbatim, do not recompute):"]
+        if variants:
+            for day in sorted(variants, key=int):
+                out.append(f"  - {day}-day total: {fmt(common + variants[day])}")
+        else:
+            out.append(f"  - total: {fmt(common)}")
+        if refundable:
+            out.append(
+                f"  - plus refundable deposit/guarantee: {refundable:g} AED "
+                "(returned later, NOT part of the cost)"
+            )
+        if variable:
+            out.append("  - plus variable fees: " + ", ".join(variable))
+        if optional:
+            out.append("  - optional: " + "; ".join(optional))
+        return out
+
+    @staticmethod
     def _format(row: dict) -> str:
         lines = [
             f"SERVICE: {row['name']}  (relevance: {row['score']:.3f})",
@@ -194,6 +248,7 @@ class GraphRetriever(BaseRetriever):
                 lines.append(
                     f"  - {f['name']}: {amount} ({f['feeType']}, applies: {f['appliesWhen']})"
                 )
+            lines.extend(GraphRetriever._fee_totals(fees))
 
         if row["channels"]:
             lines.append("Channels: " + ", ".join(row["channels"]))

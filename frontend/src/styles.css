@@ -285,6 +285,17 @@ button.stop {
   padding-inline-start: 1em;
 }
 
+.tool-chip {
+  display: inline-block;
+  padding: 6px 12px;
+  margin: 4px 0;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 13px;
+}
+
 .muted {
   color: var(--muted);
 }

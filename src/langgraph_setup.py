@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 from typing import Literal
 from uuid import uuid4
@@ -10,8 +11,8 @@ from langgraph.prebuilt import ToolNode
 from langgraph.types import Command
 from langgraph.checkpoint.memory import InMemorySaver
 
-from .backend_setup import llm
-from .tools_setup import TOOLS, retrieve
+from .backend_setup import llm, clarifier_llm
+from .tools_setup import TOOLS
 from .system_prompt_setup import build_system_prompt, NO_THINK
 
 logger = logging.getLogger("uvicorn.error")
@@ -23,6 +24,7 @@ MAX_CLARIFY = 2  # loop guard: max requery/reprompt cycles per turn before forci
 class ClarifierState(MessagesState):
     clarify_count: int   # how many clarify cycles have happened this turn
     mode: str            # "answer" (normal) | "ask" (responder should ask, not answer)
+    improved_query: str  # set by the clarifier on requery; consumed by issue_retrieve
 
 
 # ---- clarifier's structured decision (deterministic routing, not free text) ----
@@ -42,11 +44,11 @@ CLARIFIER_PROMPT = (
     "You are the Clarifier in a RAG pipeline for GDRFA Dubai visa services.\n"
     "You are given the user's question, the search query the retriever used, and the retrieved "
     "passages. Choose EXACTLY ONE action:\n"
-    "- 'proceed': the question is clear and the passages can answer it. This is the default — "
-    "prefer it.\n"
-    "- 'requery': the passages don't answer the question because the search query was too vague, "
-    "too broad, or off-target, AND you can write a better, more specific query yourself. Put that "
-    "query in 'improved_query'.\n"
+    "- 'proceed': the passages contain ANY information that directly answers the question. This "
+    "is the default — prefer it. Do NOT requery to narrow down or refine a question the passages "
+    "already answer.\n"
+    "- 'requery': the passages are clearly off-topic or empty for this question, AND you can "
+    "write a better, more specific query yourself. Put that query in 'improved_query'.\n"
     "- 'reprompt': the user's question is genuinely ambiguous or missing details that only the "
     "USER can provide (e.g. which visa type, their nationality / status / assets), so no query can "
     "answer it well.\n"
@@ -56,47 +58,173 @@ CLARIFIER_PROMPT = (
 
 def reset_turn(state: ClarifierState):
     """Runs once at the start of every turn so counters/flags never leak across turns."""
-    return {"clarify_count": 0, "mode": "answer"}
+    return {"clarify_count": 0, "mode": "answer", "improved_query": ""}
 
 
-def first_retrieve(state: ClarifierState):
-    """First-pass retrieval without an LLM: search with the user's own words.
+# Messages the responder answers directly — no knowledge-base search.
+# Three families: pure small talk, questions about the assistant itself, and
+# questions about the stored user profile (it's injected into the system
+# prompt already). Each pattern must match the WHOLE message and respect a
+# length cap, so any real content fails the match and retrieval runs.
+_PUNCT = r"[\s!.,؟?،]*"
+_SKIP_RETRIEVAL_PATTERNS = [
+    # -- small talk / acknowledgements --
+    (re.compile(
+        r"^(hi+|hello|hey+|yo|good (morning|afternoon|evening)|how are you\??|"
+        r"how's it going\??|thanks?( you)?( so much)?|thank you|ok(ay)?( thanks?)?|"
+        r"got it|cool|nice|great|perfect|awesome|bye|goodbye|see you|"
+        r"salam|hala+|marhaba|"
+        r"مرحبا+|اهلا+|أهلا+|هلا+|السلام عليكم( ورحمة الله( وبركاته)?)?|"
+        r"صباح الخير|مساء الخير|كيف حالك؟?|شكرا+( جزيلا)?( لك)?|تمام( شكرا)?|"
+        r"ممتاز|رائع|حلو|مع السلامة|وداعا)"
+        + _PUNCT + r"$",
+        re.IGNORECASE,
+    ), 40),
+    # -- about the assistant (capabilities / identity / help) --
+    (re.compile(
+        r"^((what|who) are you\??|who r u|what can you (do|help( me)? with)( for me)?\??|"
+        r"what do you do\??|how can you help( me)?\??|"
+        r"what (kind of )?(things|questions|stuff) can (you|u) (do|answer|help with)\??|"
+        r"help( me)?|tell me (about yourself|what you can do)|"
+        r"what is this( chatbot| assistant| app)?\??|"
+        r"من أنت؟?|من انت؟?|ماذا تستطيع( أن تفعل)?؟?|ماذا يمكنك( أن تفعل)?؟?|"
+        r"شو بتقدر تسوي؟?|كيف (يمكنك )?(أن )?تساعدني؟?|ما هذا؟?|مساعدة)"
+        + _PUNCT + r"$",
+        re.IGNORECASE,
+    ), 60),
+    # -- about the stored user profile / memory --
+    (re.compile(
+        r"^(what('s| is) in your (chat )?memory\??|"
+        r"what do you (know|remember)( about me)?\??|"
+        r"what('s| is) my profile\??|do you (know|remember) me\??|"
+        r"ماذا تعرف عني؟?|ماذا تتذكر( عني)?؟?)"
+        + _PUNCT + r"$",
+        re.IGNORECASE,
+    ), 60),
+]
 
-    Saves the 1.5-4s query-writing LLM call on every turn; when the naive
-    query retrieves poorly, the clarifier's 'requery' loop brings the LLM
-    back in via `retrieve agent`.
-    """
-    question = ""
-    for msg in reversed(state["messages"]):
-        if isinstance(msg, HumanMessage):
-            question = str(msg.content)
+
+def _skip_retrieval(text: str) -> bool:
+    t = text.strip().lower()
+    if not t:
+        return False
+    return any(
+        len(t) <= max_len and pattern.match(t)
+        for pattern, max_len in _SKIP_RETRIEVAL_PATTERNS
+    )
+
+
+# ---- LLM router: does this message need a knowledge-base search? ----
+# The regex above is only the zero-latency fast path for dead-obvious cases;
+# everything else gets one small structured-output call. Biased to retrieve:
+# unclear cases and router errors both fall through to retrieval.
+class RouteDecision(BaseModel):
+    needs_retrieval: bool = Field(
+        description="true if answering requires searching the UAE visa/residency "
+        "knowledge base; false if the message can be answered without it."
+    )
+    search_query: str | None = Field(
+        default=None,
+        description="When needs_retrieval is true: a short, self-contained "
+        "search query for the knowledge base, in the user's language. Resolve "
+        "pronouns and references using the previous answer.",
+    )
+
+
+ROUTER_PROMPT = (
+    "You route messages for a UAE visa/residency assistant. Decide whether the "
+    "LATEST USER MESSAGE requires searching the visa-services knowledge base.\n"
+    "needs_retrieval=false for: greetings/small talk; questions about the "
+    "assistant itself; questions about the user's saved details; requests to "
+    "transform the PREVIOUS ANSWER — translate it, repeat it, summarize it, "
+    "shorten/expand it, reformat it, or explain part of it.\n"
+    "needs_retrieval=true for: ANY question about visa/residency/permit "
+    "services, fees, documents, eligibility, or processes — including "
+    "follow-ups that ask about a different service, option, duration, or "
+    "detail than the previous answer covered.\n"
+    "If in doubt, choose true.\n"
+    "When needs_retrieval=true, also write search_query: a concise standalone "
+    "query naming the service and the detail asked about, resolving references "
+    "via the previous answer (e.g. after a transit-visa answer, 'what about "
+    "tourist visa' -> 'tourist visa fees'; 'what about the multi entry one?' "
+    "-> 'multi entry tourist visa fees')."
+)
+
+
+def _router_view(state: ClarifierState, latest: str) -> list:
+    prev_answer = ""
+    for msg in reversed(state["messages"][:-1]):
+        if isinstance(msg, AIMessage) and msg.content:
+            prev_answer = str(msg.content)[:600]
             break
-    return {
-        "messages": [
-            AIMessage(
-                content="",
-                tool_calls=[{
-                    "name": "retrieve",
-                    "args": {"query": question},
-                    "id": f"first-retrieve-{uuid4().hex[:8]}",
-                    "type": "tool_call",
-                }],
+    return [
+        HumanMessage(
+            content=(
+                f"PREVIOUS ANSWER (truncated):\n{prev_answer or '(none)'}\n\n"
+                f"LATEST USER MESSAGE: {latest}"
             )
-        ]
-    }
+        )
+    ]
 
 
-def retrieve_agent(state: ClarifierState):
-    """Forces a retrieval tool call so the pipeline always grounds its answer."""
+def _needs_retrieval(state: ClarifierState, query: str) -> tuple[bool, str]:
+    """Returns (needs_retrieval, search_query). Fails open to (True, verbatim)."""
+    t0 = time.perf_counter()
+    search_query = query
     try:
-        t0 = time.perf_counter()
-        system = SystemMessage(content=build_system_prompt())
-        response = llm.bind_tools([retrieve], tool_choice="retrieve").invoke([system] + state["messages"])
-        logger.info(f"[timing] retrieve agent (LLM): {time.perf_counter() - t0:.2f}s")
-        return {"messages": [response]}
+        decision = clarifier_llm.with_structured_output(RouteDecision).invoke(
+            [SystemMessage(content=ROUTER_PROMPT + NO_THINK)] + _router_view(state, query)
+        )
+        needs = decision.needs_retrieval
+        if needs and decision.search_query and decision.search_query.strip():
+            search_query = decision.search_query.strip()
     except Exception as e:
-        logger.error(f"Error in retrieve agent: {e}")
-        return {"messages": [AIMessage(content="An error occurred while processing your request, retriever agent.")]}
+        logger.error(f"Error in retrieval router, defaulting to retrieve: {e}")
+        needs = True
+    logger.info(
+        f"[timing] router: {time.perf_counter() - t0:.2f}s | retrieve={needs}"
+        + (f" | query={search_query!r}" if needs else "")
+    )
+    return needs, search_query
+
+
+def issue_retrieve(state: ClarifierState) -> Command[Literal["retriever", "responder agent"]]:
+    """Issue the retrieval tool call without an LLM — or skip it for small talk.
+
+    First pass searches with the user's own words; on requery it uses the
+    clarifier's improved_query directly. Pure greetings/thanks skip retrieval
+    entirely (straight to the responder); the check fails toward retrieval, so
+    anything with real content always searches.
+    """
+    query = state.get("improved_query", "")
+    if not query:
+        for msg in reversed(state["messages"]):
+            if isinstance(msg, HumanMessage):
+                query = str(msg.content)
+                break
+        if _skip_retrieval(query):
+            logger.info("[router] small talk / meta question -> skipping retrieval")
+            return Command(goto="responder agent")
+        needs, query = _needs_retrieval(state, query)
+        if not needs:
+            logger.info("[router] LLM router -> skipping retrieval")
+            return Command(goto="responder agent")
+    return Command(
+        goto="retriever",
+        update={
+            "messages": [
+                AIMessage(
+                    content="",
+                    tool_calls=[{
+                        "name": "retrieve",
+                        "args": {"query": query},
+                        "id": f"retrieve-{uuid4().hex[:8]}",
+                        "type": "tool_call",
+                    }],
+                )
+            ]
+        },
+    )
 
 
 def _clarifier_view(state: ClarifierState) -> list:
@@ -125,7 +253,7 @@ def _clarifier_view(state: ClarifierState) -> list:
     ]
 
 
-def clarifier_agent(state: ClarifierState) -> Command[Literal["retrieve agent", "responder agent"]]:
+def clarifier_agent(state: ClarifierState) -> Command[Literal["issue retrieve", "responder agent"]]:
     """Judges the query/retrieval and routes: proceed, requery, or reprompt the user."""
     count = state.get("clarify_count", 0)
     try:
@@ -137,19 +265,20 @@ def clarifier_agent(state: ClarifierState) -> Command[Literal["retrieve agent", 
             return Command(goto="responder agent")
 
         system = SystemMessage(content=CLARIFIER_PROMPT + NO_THINK)
-        decision = llm.with_structured_output(ClarifierDecision).invoke([system] + _clarifier_view(state))
+        decision = clarifier_llm.with_structured_output(ClarifierDecision).invoke([system] + _clarifier_view(state))
         logger.info(
             f"[timing] clarifier node: {time.perf_counter() - t0:.2f}s "
             f"| action={decision.action} | count={count}"
         )
 
         if decision.action == "requery" and decision.improved_query:
-            # Re-run retrieval with a better query (loop back), and count the cycle.
+            # Re-run retrieval with the clarifier's own query — no LLM rewrite,
+            # no synthetic user message polluting the thread/UI.
             logger.info(f"[clarifier] requery -> {decision.improved_query!r}")
             return Command(
-                goto="retrieve agent",
+                goto="issue retrieve",
                 update={
-                    "messages": [HumanMessage(content=f"(clarified query) {decision.improved_query}")],
+                    "improved_query": decision.improved_query,
                     "clarify_count": count + 1,
                 },
             )
@@ -198,16 +327,16 @@ def responder_agent(state: ClarifierState):
 
 builder = StateGraph(ClarifierState)
 builder.add_node("reset", reset_turn)
-builder.add_node("first retrieve", first_retrieve)
-builder.add_node("retrieve agent", retrieve_agent)
+builder.add_node("issue retrieve", issue_retrieve)
 builder.add_node("retriever", ToolNode(TOOLS))
 builder.add_node("clarifier", clarifier_agent)
 builder.add_node("responder agent", responder_agent)
 
 builder.add_edge(START, "reset")
-builder.add_edge("reset", "first retrieve")       # first pass: no LLM
-builder.add_edge("first retrieve", "retriever")
-builder.add_edge("retrieve agent", "retriever")   # requery path keeps the LLM
+builder.add_edge("reset", "issue retrieve")
+# "issue retrieve" routes itself via Command: -> "retriever" (normal questions,
+# and requeries with the clarifier's improved_query) or -> "responder agent"
+# (pure small talk, no retrieval).
 builder.add_edge("retriever", "clarifier")
 # "clarifier" routes itself via Command(goto=...) -> "retrieve agent" (requery) or "responder agent"
 builder.add_edge("responder agent", END)

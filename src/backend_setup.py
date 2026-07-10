@@ -33,6 +33,27 @@ try:
 except Exception as e:
     logger.error(f"Error initializing LLM: {e}")
 
+# The clarifier is a simple 3-way judgment; a small model does it in a fraction
+# of the time. Set CLARIFIER_MODEL (e.g. qwen/qwen3-8b) to enable; defaults to
+# the main model.
+clarifier_llm = llm
+_clarifier_model = os.getenv("CLARIFIER_MODEL")
+if _clarifier_model:
+    try:
+        clarifier_llm = ChatOpenRouter(
+            model=_clarifier_model,
+            api_key=os.getenv("OPENROUTER_API_KEY"),
+            temperature=0,
+            reasoning={"effort": "none"},
+            openrouter_provider={"sort": "throughput"},
+            seed=42,
+            disable_streaming="tool_calling",
+        )
+        logger.info(f"Clarifier LLM: {_clarifier_model}")
+    except Exception as e:
+        logger.error(f"Error initializing clarifier LLM, falling back to main: {e}")
+        clarifier_llm = llm
+
 # old retriever that used to be with fast embed and in memory vector store
 # try:
 #     logger.info("Initializing retriever...")
