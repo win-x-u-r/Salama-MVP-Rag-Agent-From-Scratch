@@ -1,7 +1,4 @@
-import json
 import os
-
-from .tools_setup import load_profile
 
 # Qwen3 soft switch: "/no_think" in the prompt disables the thinking preamble,
 # which otherwise delays the first answer token. Empty for non-Qwen3 models.
@@ -32,25 +29,20 @@ BASE_SYSTEM_PROMPT = (
     "- Be concise: short sentences or bullet points in maximum 50 words. If the answer isn't in the knowledge "
     "base, say so. If the question is unrelated to UAE visas, say so without retrieving.\n\n"
     "PERSONAL DETAILS & ELIGIBILITY:\n"
-    "- When the user shares personal details relevant to eligibility (nationality, age, "
-    "profession, status, salary, bank deposit, property value, company investment, annual "
-    "tax, GPA, university, education), call `save_user_profile` to store them.\n"
+    "- Personal details the user shares (nationality, status, salary, deposits, "
+    "education...) are stored automatically and appear under KNOWN USER FACTS below.\n"
     "- For eligibility questions ('am I eligible for X'): FIRST `retrieve` that visa's "
-    "requirements, THEN compare them against the user's KNOWN PROFILE below.\n"
-    "- If a required detail is missing from the profile, ASK the user for that specific "
-    "detail instead of guessing. When they answer, save it and continue.\n"
+    "requirements, THEN compare them against the KNOWN USER FACTS below.\n"
+    "- If a required detail is missing from the known facts, ASK the user for that "
+    "specific detail instead of guessing.\n"
     "- Give a clear verdict: which requirements are met, which are not, and the bottom line.\n"
     "- Make sure you normalize the output, for example: golden_visa would become `Golden Visa`\n"
     "- Answer in the same language the user speaks."
 )
 
 
-def build_system_prompt() -> str:
-    """Base instructions + the live user profile, injected on every turn."""
-    profile = load_profile()
-    profile_text = (
-        json.dumps(profile, ensure_ascii=False, indent=2)
-        if profile
-        else "(no personal details saved yet)"
-    )
-    return f"{BASE_SYSTEM_PROMPT}\n\nKNOWN USER PROFILE:\n{profile_text}{NO_THINK}"
+def build_system_prompt(facts_text: str | None = None) -> str:
+    """Base instructions + semantically recalled user facts, injected per turn."""
+    if not facts_text:
+        facts_text = "(no personal details saved yet)"
+    return f"{BASE_SYSTEM_PROMPT}\n\nKNOWN USER FACTS:\n{facts_text}{NO_THINK}"

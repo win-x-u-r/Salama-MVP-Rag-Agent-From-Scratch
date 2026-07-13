@@ -8,10 +8,11 @@ from pydantic import BaseModel, Field
 from langchain_core.messages import SystemMessage, AIMessage, HumanMessage, ToolMessage
 from langgraph.graph import START, END, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
+from langgraph.store.base import BaseStore
 from langgraph.types import Command
 from langgraph.checkpoint.memory import InMemorySaver
 
-from .backend_setup import llm, clarifier_llm
+from .backend_setup import llm, clarifier_llm, store as memory_store
 from .tools_setup import TOOLS
 from .system_prompt_setup import build_system_prompt, NO_THINK
 
@@ -19,12 +20,19 @@ logger = logging.getLogger("uvicorn.error")
 
 MAX_CLARIFY = 2  # loop guard: max requery/reprompt cycles per turn before forcing an answer
 
+# Single local user for now; swap for an id from AG-UI forwardedProps for multi-user.
+MEMORY_USER_ID = "local-user"
+FACTS_NAMESPACE = ("users", MEMORY_USER_ID, "facts")
+THREADS_NAMESPACE = ("users", MEMORY_USER_ID, "threads")  # conversation titles/recency
+
 
 # ---- graph state: MessagesState + per-turn control fields ----
 class ClarifierState(MessagesState):
     clarify_count: int   # how many clarify cycles have happened this turn
     mode: str            # "answer" (normal) | "ask" (responder should ask, not answer)
     improved_query: str  # set by the clarifier on requery; consumed by issue_retrieve
+    save_facts: bool     # router flagged personal facts -> memory writer runs
+    memory_erased: bool  # facts were wiped this turn -> responder confirms it
 
 
 # ---- clarifier's structured decision (deterministic routing, not free text) ----
@@ -58,7 +66,13 @@ CLARIFIER_PROMPT = (
 
 def reset_turn(state: ClarifierState):
     """Runs once at the start of every turn so counters/flags never leak across turns."""
-    return {"clarify_count": 0, "mode": "answer", "improved_query": ""}
+    return {
+        "clarify_count": 0,
+        "mode": "answer",
+        "improved_query": "",
+        "save_facts": False,
+        "memory_erased": False,
+    }
 
 
 
@@ -122,6 +136,18 @@ class RouteDecision(BaseModel):
         "search query for the knowledge base, in the user's language. Resolve "
         "pronouns and references using the previous answer.",
     )
+    shares_personal_facts: bool = Field(
+        default=False,
+        description="true when the LATEST USER MESSAGE states durable personal "
+        "details about the user (nationality, profession, salary, deposits, "
+        "assets, education, family status). Questions alone are false.",
+    )
+    erase_memory: bool = Field(
+        default=False,
+        description="true ONLY when the user explicitly asks to delete, clear, "
+        "or forget their stored personal information. Asking what is "
+        "remembered is false.",
+    )
 
 
 ROUTER_PROMPT = (
@@ -140,7 +166,17 @@ ROUTER_PROMPT = (
     "query naming the service and the detail asked about, resolving references "
     "via the previous answer (e.g. after a transit-visa answer, 'what about "
     "tourist visa' -> 'tourist visa fees'; 'what about the multi entry one?' "
-    "-> 'multi entry tourist visa fees')."
+    "-> 'multi entry tourist visa fees').\n"
+    "Separately, set shares_personal_facts=true when the latest message states "
+    "durable personal details about the user themselves (nationality, "
+    "profession, salary, deposits, assets, education, family) — INCLUDING when "
+    "the details appear inside a question (e.g. 'I am Jordanian, can I enter?' "
+    "-> true). Merely asking about a topic, or the assistant mentioning "
+    "details, does NOT count.\n"
+    "Separately, set erase_memory=true ONLY when the user explicitly asks to "
+    "delete, clear, reset, or forget their stored personal details (e.g. "
+    "'forget my information', 'delete my data'). Asking WHAT you remember is "
+    "not an erase request."
 )
 
 
@@ -160,15 +196,24 @@ def _router_view(state: ClarifierState, latest: str) -> list:
     ]
 
 
-def _needs_retrieval(state: ClarifierState, query: str) -> tuple[bool, str]:
-    """Returns (needs_retrieval, search_query). Fails open to (True, verbatim)."""
+def _needs_retrieval(state: ClarifierState, query: str) -> tuple[bool, str, bool, bool]:
+    """Returns (needs_retrieval, search_query, shares_facts, erase_memory).
+
+    Fails open to (True, verbatim, True, False): on router errors we'd rather
+    waste a retrieval than lose an answer or a fact — but never erase by
+    accident.
+    """
     t0 = time.perf_counter()
     search_query = query
+    shares_facts = True
+    erase = False
     try:
         decision = clarifier_llm.with_structured_output(RouteDecision).invoke(
             [SystemMessage(content=ROUTER_PROMPT + NO_THINK)] + _router_view(state, query)
         )
         needs = decision.needs_retrieval
+        shares_facts = decision.shares_personal_facts
+        erase = decision.erase_memory
         if needs and decision.search_query and decision.search_query.strip():
             search_query = decision.search_query.strip()
     except Exception as e:
@@ -177,11 +222,34 @@ def _needs_retrieval(state: ClarifierState, query: str) -> tuple[bool, str]:
     logger.info(
         f"[timing] router: {time.perf_counter() - t0:.2f}s | retrieve={needs}"
         + (f" | query={search_query!r}" if needs else "")
+        + f" | facts={shares_facts}"
+        + (" | ERASE" if erase else "")
     )
-    return needs, search_query
+    return needs, search_query, shares_facts, erase
 
 
-def issue_retrieve(state: ClarifierState) -> Command[Literal["retriever", "responder agent"]]:
+def _retrieve_call(query: str) -> AIMessage:
+    """The synthetic tool-call message that triggers the retriever node."""
+    return AIMessage(
+        content="",
+        tool_calls=[{
+            "name": "retrieve",
+            "args": {"query": query},
+            "id": f"retrieve-{uuid4().hex[:8]}",
+            "type": "tool_call",
+        }],
+    )
+
+
+def _erase_facts(store: BaseStore) -> int:
+    """Deterministic PII wipe — the LLM only flags the request, code executes it."""
+    items = store.search(FACTS_NAMESPACE, limit=1000)
+    for item in items:
+        store.delete(FACTS_NAMESPACE, item.key)
+    return len(items)
+
+
+def issue_retrieve(state: ClarifierState, *, store: BaseStore = None) -> Command[Literal["retriever", "responder agent"]]:
     """Issue the retrieval tool call without an LLM — or skip it for small talk.
 
     First pass searches with the user's own words; on requery it uses the
@@ -198,26 +266,23 @@ def issue_retrieve(state: ClarifierState) -> Command[Literal["retriever", "respo
         if _skip_retrieval(query):
             logger.info("[router] small talk / meta question -> skipping retrieval")
             return Command(goto="responder agent")
-        needs, query = _needs_retrieval(state, query)
+        needs, query, shares_facts, erase = _needs_retrieval(state, query)
+        update = {"save_facts": shares_facts}
+        if erase and store is not None:
+            try:
+                n = _erase_facts(store)
+                update["memory_erased"] = True
+                update["save_facts"] = False
+                logger.info(f"[memory] erased {n} facts by user request")
+            except Exception as e:
+                logger.error(f"Error erasing memory: {e}")
         if not needs:
             logger.info("[router] LLM router -> skipping retrieval")
-            return Command(goto="responder agent")
-    return Command(
-        goto="retriever",
-        update={
-            "messages": [
-                AIMessage(
-                    content="",
-                    tool_calls=[{
-                        "name": "retrieve",
-                        "args": {"query": query},
-                        "id": f"retrieve-{uuid4().hex[:8]}",
-                        "type": "tool_call",
-                    }],
-                )
-            ]
-        },
-    )
+            return Command(goto="responder agent", update=update)
+        update["messages"] = [_retrieve_call(query)]
+        return Command(goto="retriever", update=update)
+    # requery pass: flag was already set on the first pass this turn
+    return Command(goto="retriever", update={"messages": [_retrieve_call(query)]})
 
 
 def _clarifier_view(state: ClarifierState) -> list:
@@ -291,12 +356,40 @@ def clarifier_agent(state: ClarifierState) -> Command[Literal["issue retrieve", 
         return Command(goto="responder agent")  # fail safe -> answer with what we have
 
 
-def responder_agent(state: ClarifierState):
+def _recall_facts(store: BaseStore | None, state: ClarifierState) -> str | None:
+    """Semantic recall: the top facts relevant to the current question."""
+    if store is None:
+        return None
+    try:
+        t0 = time.perf_counter()
+        question = ""
+        for msg in reversed(state["messages"]):
+            if isinstance(msg, HumanMessage):
+                question = str(msg.content)
+                break
+        hits = store.search(FACTS_NAMESPACE, query=question or None, limit=5)
+        logger.info(
+            f"[timing] memory recall: {time.perf_counter() - t0:.2f}s | hits={len(hits)}"
+        )
+        if not hits:
+            return None
+        return "\n".join(f"- {h.value.get('text', '')}" for h in hits)
+    except Exception as e:
+        logger.error(f"Error recalling memories: {e}")
+        return None
+
+
+def responder_agent(state: ClarifierState, *, store: BaseStore = None):
     """Streams the final answer, OR (mode='ask') a clarifying question back to the user."""
     try:
         t0 = time.perf_counter()
         mode = state.get("mode", "answer")
-        prompt = build_system_prompt()
+        prompt = build_system_prompt(_recall_facts(store, state))
+        if state.get("memory_erased"):
+            prompt += (
+                "\n\nNOTE: The user's stored personal details were just erased at "
+                "their request. Confirm clearly that everything was deleted."
+            )
         if mode == "ask":
             prompt += (
                 "\n\nIMPORTANT: The user's question is too vague or missing details to answer well. "
@@ -318,12 +411,81 @@ def responder_agent(state: ClarifierState):
         return {"messages": [AIMessage(content="An error occurred while compiling your answer, responder agent.")]}
 
 
+# ---- long-term memory writer: runs AFTER the answer has streamed ----
+class MemoryFact(BaseModel):
+    key: str = Field(
+        description="stable snake_case id for the fact type, e.g. 'nationality', "
+        "'bank_deposit_aed', 'profession' — newer values overwrite older ones"
+    )
+    text: str = Field(
+        description="short third-person fact, e.g. 'User is an Indian national'"
+    )
+
+
+class MemoryExtraction(BaseModel):
+    facts: list[MemoryFact] = Field(
+        default_factory=list,
+        description="durable personal facts the USER stated; empty if none",
+    )
+
+
+MEMORY_WRITER_PROMPT = (
+    "You maintain long-term memory for a UAE visa assistant. From the exchange, "
+    "extract durable personal facts the USER stated about themselves that matter "
+    "for visa eligibility or personalization: nationality, age, profession, status "
+    "(investor/student/employee), salary, bank deposit, property value, company "
+    "investment, education, GPA, family situation. Rules:\n"
+    "- Only facts the USER stated about themselves. Never store information from "
+    "the assistant's answer, and never store the question topic itself.\n"
+    "- Use a stable snake_case key per fact type (e.g. 'salary_aed', 'nationality') "
+    "so newer values overwrite older ones.\n"
+    "- If no durable personal facts were shared, return an empty list."
+)
+
+
+def memory_writer(state: ClarifierState, *, store: BaseStore = None):
+    """Extracts durable user facts into the store — after streaming, so it adds
+    no user-facing latency. Stable keys make updates overwrite (dedup).
+
+    Runs only when the router flagged the message as sharing personal facts
+    (save_facts), so ordinary questions don't pay an extraction call."""
+    if store is None or not state.get("save_facts"):
+        return {}
+    try:
+        t0 = time.perf_counter()
+        question, answer = "", ""
+        for msg in reversed(state["messages"]):
+            if not answer and isinstance(msg, AIMessage) and msg.content:
+                answer = str(msg.content)[:400]
+            elif isinstance(msg, HumanMessage):
+                question = str(msg.content)
+                break
+        if not question:
+            return {}
+        view = HumanMessage(
+            content=f"USER SAID: {question}\n\nASSISTANT ANSWERED: {answer}"
+        )
+        result = clarifier_llm.with_structured_output(MemoryExtraction).invoke(
+            [SystemMessage(content=MEMORY_WRITER_PROMPT + NO_THINK), view]
+        )
+        for f in result.facts:
+            store.put(FACTS_NAMESPACE, f.key, {"text": f.text}, index=["text"])
+        logger.info(
+            f"[timing] memory writer: {time.perf_counter() - t0:.2f}s "
+            f"| facts={[f.key for f in result.facts]}"
+        )
+    except Exception as e:
+        logger.error(f"Error in memory writer: {e}")
+    return {}
+
+
 builder = StateGraph(ClarifierState)
 builder.add_node("reset", reset_turn)
 builder.add_node("issue retrieve", issue_retrieve)
 builder.add_node("retriever", ToolNode(TOOLS))
 builder.add_node("clarifier", clarifier_agent)
 builder.add_node("responder agent", responder_agent)
+builder.add_node("memory writer", memory_writer)
 
 builder.add_edge(START, "reset")
 builder.add_edge("reset", "issue retrieve")
@@ -331,11 +493,14 @@ builder.add_edge("reset", "issue retrieve")
 # and requeries with the clarifier's improved_query) or -> "responder agent"
 # (pure small talk, no retrieval).
 builder.add_edge("retriever", "clarifier")
-# "clarifier" routes itself via Command(goto=...) -> "retrieve agent" (requery) or "responder agent"
-builder.add_edge("responder agent", END)
+# "clarifier" routes itself via Command(goto=...) -> "issue retrieve" (requery) or "responder agent"
+builder.add_edge("responder agent", "memory writer")
+builder.add_edge("memory writer", END)
 
-checkpointer = InMemorySaver()  # short-term (conversation) memory, per thread
-graph = builder.compile(checkpointer=checkpointer)
+# Compiled with an in-memory checkpointer; main.py's startup hook replaces it
+# with AsyncPostgresSaver (needs a running event loop) for durable conversations.
+checkpointer = InMemorySaver()
+graph = builder.compile(checkpointer=checkpointer, store=memory_store)
 
 # Single local user
 THREAD_ID = "local-user"
