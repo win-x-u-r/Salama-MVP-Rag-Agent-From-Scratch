@@ -1,3 +1,4 @@
+import json
 import os
 import logging
 import time
@@ -6,9 +7,13 @@ from ag_ui_langgraph import LangGraphAgent, add_langgraph_fastapi_endpoint
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
+from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
-from src.agent_core import GRAPH_CONFIG, PROFILE_PATH, graph, load_profile
+from src.agent_core import GRAPH_CONFIG, graph
+from src.backend_setup import DB_URI, store
+from src.langgraph_setup import FACTS_NAMESPACE, THREADS_NAMESPACE
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -60,7 +65,93 @@ class AguiTimingMiddleware:
         await self.app(scope, receive, timed_send)
 
 
+def _register_thread(thread_id: str, first_user_msg: str) -> None:
+    """Upsert the conversation in the store: title from the first user message
+    for new threads, updated_at bump for existing ones (drives sidebar order)."""
+    existing = store.get(THREADS_NAMESPACE, thread_id)
+    if existing is None:
+        title = (first_user_msg or "").strip().replace("\n", " ")[:60] or "New chat"
+        store.put(THREADS_NAMESPACE, thread_id, {"title": title}, index=False)
+    else:
+        store.put(THREADS_NAMESPACE, thread_id, existing.value, index=False)
+
+
+class ThreadRegistryMiddleware:
+    """Reads each /agui request body to auto-register its conversation.
+
+    Buffers the ASGI request body (then replays it downstream) to extract the
+    threadId and the latest user message — no endpoint changes needed.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["path"] != "/agui":
+            return await self.app(scope, receive, send)
+
+        chunks = []
+        while True:
+            message = await receive()
+            chunks.append(message)
+            if not message.get("more_body", False):
+                break
+        body = b"".join(c.get("body", b"") for c in chunks)
+
+        replay_queue = list(chunks)
+
+        async def replay():
+            if replay_queue:
+                return replay_queue.pop(0)
+            # buffered messages exhausted: delegate so disconnect events flow
+            # (returning a synthetic message here busy-loops the disconnect listener)
+            return await receive()
+
+        if store is not None:
+            try:
+                data = json.loads(body)
+                thread_id = data.get("threadId")
+                last_user = next(
+                    (str(m.get("content", "")) for m in reversed(data.get("messages", []))
+                     if m.get("role") == "user"),
+                    "",
+                )
+                if thread_id:
+                    await run_in_threadpool(_register_thread, thread_id, last_user)
+            except Exception as e:
+                logger.error(f"Error registering thread: {e}")
+
+        await self.app(scope, replay, send)
+
+
 app.add_middleware(AguiTimingMiddleware)
+app.add_middleware(ThreadRegistryMiddleware)
+
+
+@app.on_event("startup")
+async def _attach_durable_checkpointer():
+    """Swap the graph's InMemorySaver for AsyncPostgresSaver.
+
+    Built here because AsyncConnectionPool requires a running event loop,
+    which doesn't exist at module import time. Checkpoint tables were already
+    created by the sync setup in backend_setup.py.
+    """
+    if store is None:
+        logger.warning("Postgres unavailable -> conversations will not persist")
+        return
+    from psycopg_pool import AsyncConnectionPool
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+    pool = AsyncConnectionPool(
+        DB_URI,
+        min_size=1,
+        max_size=10,
+        open=False,
+        kwargs={"autocommit": True, "prepare_threshold": 0},
+    )
+    await pool.open()
+    graph.checkpointer = AsyncPostgresSaver(pool)
+    logger.info("Durable Postgres checkpointer attached.")
 
 # AG-UI protocol endpoint: streams the run as AG-UI events (SSE) for the React client
 add_langgraph_fastapi_endpoint(
@@ -83,30 +174,95 @@ class Query(BaseModel):
     question: str
 
 
+class ThreadRename(BaseModel):
+    title: str
+
+
+@app.get("/threads")
+def list_threads():
+    """Conversations, most recently active first."""
+    if store is None:
+        return []
+    items = store.search(THREADS_NAMESPACE, limit=200)
+    items.sort(key=lambda i: i.updated_at, reverse=True)
+    return [
+        {"id": i.key, "title": i.value.get("title", "New chat"), "updatedAt": str(i.updated_at)}
+        for i in items
+    ]
+
+
+@app.patch("/threads/{thread_id}")
+def rename_thread(thread_id: str, body: ThreadRename):
+    if store is None:
+        return {"error": "store unavailable"}
+    title = body.title.strip()[:60] or "New chat"
+    store.put(THREADS_NAMESPACE, thread_id, {"title": title}, index=False)
+    return {"id": thread_id, "title": title}
+
+
+@app.delete("/threads/{thread_id}")
+async def delete_thread(thread_id: str):
+    """Remove the conversation: sidebar entry + its checkpoint history."""
+    if store is None:
+        return {"error": "store unavailable"}
+    store.delete(THREADS_NAMESPACE, thread_id)
+    try:
+        await graph.checkpointer.adelete_thread(thread_id)
+    except Exception as e:
+        logger.error(f"Error deleting thread checkpoints: {e}")
+    return {"status": "deleted", "id": thread_id}
+
+
+@app.get("/threads/{thread_id}/messages")
+async def thread_messages(thread_id: str):
+    """Visible message history for a thread (user + assistant text only)."""
+    state = await graph.aget_state({"configurable": {"thread_id": thread_id}})
+    msgs = state.values.get("messages", []) if state and state.values else []
+    out = []
+    for m in msgs:
+        if isinstance(m, HumanMessage):
+            out.append({"id": m.id or f"u{len(out)}", "role": "user", "content": str(m.content)})
+        elif isinstance(m, AIMessage) and m.content:
+            out.append({"id": m.id or f"a{len(out)}", "role": "assistant", "content": str(m.content)})
+    return out
+
+
 @app.get("/profile")
 def get_profile():
     """Inspect what the agent currently remembers about the user."""
-    return load_profile()
+    if store is None:
+        return {"error": "memory store unavailable"}
+    try:
+        items = store.search(FACTS_NAMESPACE, limit=100)
+        return {item.key: item.value.get("text") for item in items}
+    except Exception as e:
+        logger.error(f"Error reading profile: {e}")
+        return {"error": "could not read profile"}
 
 
 @app.post("/profile/reset")
 def reset_profile():
-    """Clear the saved personal details."""
+    """Erase ALL saved personal details (PII wipe)."""
+    if store is None:
+        return {"error": "memory store unavailable"}
     try:
-        if os.path.exists(PROFILE_PATH):
-            os.remove(PROFILE_PATH)
-        return {"status": "profile cleared"}
+        items = store.search(FACTS_NAMESPACE, limit=1000)
+        for item in items:
+            store.delete(FACTS_NAMESPACE, item.key)
+        return {"status": "profile cleared", "removed": len(items)}
     except Exception as e:
         logger.error(f"Error resetting profile: {e}")
         return {"error": "could not reset profile"}
 
 
 @app.post("/chat")
-def chat(q: Query):
+async def chat(q: Query):
+    # async: the Postgres checkpointer is async-only, so the graph must be
+    # driven with ainvoke/astream everywhere
     try:
         logger.info("Processing chat request for question")
         t0 = time.perf_counter()
-        result = graph.invoke(
+        result = await graph.ainvoke(
             {"messages": [{"role": "user", "content": q.question}]},
             config=GRAPH_CONFIG,
         )
@@ -120,17 +276,16 @@ def chat(q: Query):
 
 @app.post("/chat/stream")
 def chat_stream(q: Query):
-    def token_gen():
+    async def token_gen():
         logger.info("Processing streaming chat request for question")
         req_start = time.perf_counter()
         first_token_logged = False
         try:
-            for token, metadata in graph.stream(
+            async for token, metadata in graph.astream(
                 {"messages": [{"role": "user", "content": q.question}]},
                 stream_mode="messages",
                 config=GRAPH_CONFIG,
-                
-            ): 
+            ):
                 if metadata.get("langgraph_node") == "responder agent" and token.content:
                     if not first_token_logged:
                         logger.info(f"[timing] time-to-first-token: {time.perf_counter() - req_start:.2f}s")

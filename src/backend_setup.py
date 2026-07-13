@@ -75,6 +75,48 @@ embeddings = OpenAIEmbeddings(
     tiktoken_model_name="text-embedding-3-large",
 )# some workaround to route the openai embedding model through openrouter
 
+# ---- long-term memory store + durable conversation checkpointer (Postgres) ----
+# PostgresStore: semantic long-term memory (facts, per-user namespaces).
+# PostgresSaver: conversations survive restarts (replaces InMemorySaver).
+from psycopg_pool import ConnectionPool
+from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.store.postgres import PostgresStore
+
+DB_URI = os.getenv("DB_URI", "")
+store = None
+try:
+    logger.info("Setting up Postgres memory store...")
+    _t0 = time.perf_counter()
+    # sync pool: used by the store from (sync) graph nodes, and for one-time DDL
+    _pg_pool = ConnectionPool(
+        DB_URI,
+        min_size=1,
+        max_size=10,
+        kwargs={"autocommit": True, "prepare_threshold": 0},
+    )
+    _pg_pool.wait(timeout=10)  # fail fast if Postgres is unreachable
+    store = PostgresStore(
+        _pg_pool,
+        index={
+            "embed": embeddings,
+            "dims": 3072,
+            # flat = exact scan: pgvector's HNSW caps at 2000 dims, and a
+            # per-user facts namespace is far too small to need ANN anyway
+            "ann_index_config": {"kind": "flat"},
+        },
+    )
+    store.setup()
+    PostgresSaver(_pg_pool).setup()  # create checkpoint tables (shared schema)
+    # NOTE: the durable checkpointer itself is AsyncPostgresSaver, attached in
+    # main.py's startup hook — its pool cannot be built without a running
+    # event loop. Until startup completes, the graph holds InMemorySaver.
+    logger.info(
+        f"Postgres store ready. [timing] setup: {time.perf_counter() - _t0:.2f}s"
+    )
+except Exception as e:
+    logger.error(f"Error setting up Postgres store (long-term memory disabled): {e}")
+    store = None
+
 RETRIEVER_BACKEND = os.getenv("RETRIEVER_BACKEND", "qdrant").lower()
 
 graph_retriever = None

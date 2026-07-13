@@ -4,10 +4,6 @@ from .backend_setup import llm, embeddings, RETRIEVER_BACKEND, graph_retriever, 
 
 from .tools_setup import (
     retrieve,
-    PROFILE_PATH,
-    load_profile,
-    save_user_profile,
-    clear_user_profile,
     TOOLS,
 )
 

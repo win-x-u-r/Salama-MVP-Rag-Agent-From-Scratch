@@ -285,6 +285,105 @@ button.stop {
   padding-inline-start: 1em;
 }
 
+.sidebar {
+  width: 240px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  background: var(--panel);
+  display: flex;
+  flex-direction: column;
+  padding: 12px;
+  gap: 10px;
+  overflow-y: auto;
+}
+
+.new-chat {
+  width: 100%;
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+  text-align: left;
+}
+
+.new-chat:hover {
+  border-color: var(--accent);
+}
+
+.thread-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow-y: auto;
+}
+
+.thread {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  color: var(--muted);
+}
+
+.thread:hover {
+  background: var(--bot);
+  color: var(--text);
+}
+
+.thread.active {
+  background: var(--bot);
+  color: var(--text);
+}
+
+.thread-title {
+  flex: 1;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.thread-rename {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--accent);
+  background: var(--bg);
+  color: var(--text);
+  outline: none;
+}
+
+.thread-actions {
+  display: none;
+  gap: 2px;
+}
+
+.thread:hover .thread-actions,
+.thread.active .thread-actions {
+  display: inline-flex;
+}
+
+button.icon {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  padding: 2px 4px;
+  font-size: 13px;
+  border-radius: 6px;
+}
+
+button.icon:hover {
+  color: var(--text);
+  background: var(--border);
+}
+
+.small {
+  font-size: 12px;
+}
+
 .tool-chip {
   display: inline-block;
   padding: 6px 12px;
