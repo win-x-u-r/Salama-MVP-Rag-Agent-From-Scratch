@@ -195,9 +195,9 @@ def issue_retrieve(state: ClarifierState) -> Command[Literal["retriever", "respo
             if isinstance(msg, HumanMessage):
                 query = str(msg.content)
                 break
-        if _skip_retrieval(query):
-            logger.info("[router] small talk / meta question -> skipping retrieval")
-            return Command(goto="responder agent")
+        # if _skip_retrieval(query):
+        #     logger.info("[router] small talk / meta question -> skipping retrieval")
+        #     return Command(goto="responder agent")
         needs, query = _needs_retrieval(state, query)
         if not needs:
             logger.info("[router] LLM router -> skipping retrieval")
