@@ -31,8 +31,8 @@ class ClarifierState(MessagesState):
     clarify_count: int   # how many clarify cycles have happened this turn
     mode: str            # "answer" (normal) | "ask" (responder should ask, not answer)
     improved_query: str  # set by the clarifier on requery; consumed by issue_retrieve
-    save_facts: bool     # router flagged personal facts -> memory writer runs
     memory_erased: bool  # facts were wiped this turn -> responder confirms it
+    recalled_facts: str  # filled by the parallel memory-recall branch
 
 
 # ---- clarifier's structured decision (deterministic routing, not free text) ----
@@ -70,8 +70,8 @@ def reset_turn(state: ClarifierState):
         "clarify_count": 0,
         "mode": "answer",
         "improved_query": "",
-        "save_facts": False,
         "memory_erased": False,
+        "recalled_facts": "",
     }
 
 
@@ -249,7 +249,7 @@ def _erase_facts(store: BaseStore) -> int:
     return len(items)
 
 
-def issue_retrieve(state: ClarifierState, *, store: BaseStore = None) -> Command[Literal["retriever", "responder agent"]]:
+def issue_retrieve(state: ClarifierState, *, store: BaseStore = None) -> Command[Literal["retriever", "responder agent", "memory writer"]]:
     """Issue the retrieval tool call without an LLM — or skip it for small talk.
 
     First pass searches with the user's own words; on requery it uses the
@@ -267,21 +267,29 @@ def issue_retrieve(state: ClarifierState, *, store: BaseStore = None) -> Command
         #     logger.info("[router] small talk / meta question -> skipping retrieval")
         #     return Command(goto="responder agent")
         needs, query, shares_facts, erase = _needs_retrieval(state, query)
-        update = {"save_facts": shares_facts}
+        update = {}
         if erase and store is not None:
             try:
                 n = _erase_facts(store)
                 update["memory_erased"] = True
-                update["save_facts"] = False
+                shares_facts = False  # a wipe turn never re-saves
                 logger.info(f"[memory] erased {n} facts by user request")
             except Exception as e:
                 logger.error(f"Error erasing memory: {e}")
-        if not needs:
+        # early dispatch: the memory writer runs as a PARALLEL branch alongside
+        # retrieval/responding — durable before the run ends, but off the
+        # critical path instead of appended after the responder
+        targets = []
+        if needs:
+            update["messages"] = [_retrieve_call(query)]
+            targets.append("retriever")
+        else:
             logger.info("[router] LLM router -> skipping retrieval")
-            return Command(goto="responder agent", update=update)
-        update["messages"] = [_retrieve_call(query)]
-        return Command(goto="retriever", update=update)
-    # requery pass: flag was already set on the first pass this turn
+            targets.append("responder agent")
+        if shares_facts and store is not None:
+            targets.append("memory writer")
+        return Command(goto=targets, update=update)
+    # requery pass: routing was decided on the first pass this turn
     return Command(goto="retriever", update={"messages": [_retrieve_call(query)]})
 
 
@@ -379,12 +387,21 @@ def _recall_facts(store: BaseStore | None, state: ClarifierState) -> str | None:
         return None
 
 
-def responder_agent(state: ClarifierState, *, store: BaseStore = None):
+def memory_recall(state: ClarifierState, *, store: BaseStore = None):
+    """Parallel branch off `reset`: fetches relevant facts concurrently with the
+    router, so recall costs nothing on the responder's critical path."""
+    return {"recalled_facts": _recall_facts(store, state) or ""}
+
+
+def responder_agent(state: ClarifierState):
     """Streams the final answer, OR (mode='ask') a clarifying question back to the user."""
     try:
         t0 = time.perf_counter()
         mode = state.get("mode", "answer")
-        prompt = build_system_prompt(_recall_facts(store, state))
+        # recall ran in parallel at turn start; if this turn erased memory,
+        # that snapshot predates the wipe — don't inject it
+        facts = None if state.get("memory_erased") else (state.get("recalled_facts") or None)
+        prompt = build_system_prompt(facts)
         if state.get("memory_erased"):
             prompt += (
                 "\n\nNOTE: The user's stored personal details were just erased at "
@@ -435,8 +452,10 @@ MEMORY_WRITER_PROMPT = (
     "for visa eligibility or personalization: nationality, age, profession, status "
     "(investor/student/employee), salary, bank deposit, property value, company "
     "investment, education, GPA, family situation. Rules:\n"
-    "- Only facts the USER stated about themselves. Never store information from "
-    "the assistant's answer, and never store the question topic itself.\n"
+    "- Only facts the USER stated about themselves in USER SAID. The previous "
+    "assistant message is context for resolving references (e.g. user answers "
+    "'2 million' to a question about deposits) — never a fact source itself. "
+    "Never store the question topic itself.\n"
     "- Use a stable snake_case key per fact type (e.g. 'salary_aed', 'nationality') "
     "so newer values overwrite older ones.\n"
     "- If no durable personal facts were shared, return an empty list."
@@ -444,26 +463,33 @@ MEMORY_WRITER_PROMPT = (
 
 
 def memory_writer(state: ClarifierState, *, store: BaseStore = None):
-    """Extracts durable user facts into the store — after streaming, so it adds
-    no user-facing latency. Stable keys make updates overwrite (dedup).
+    """Extracts durable user facts into the store, dispatched by the router as
+    a parallel branch (it never blocks the responder, which doesn't read it).
 
-    Runs only when the router flagged the message as sharing personal facts
-    (save_facts), so ordinary questions don't pay an extraction call."""
-    if store is None or not state.get("save_facts"):
+    Durable-by-design: the run only reports finished once the facts are
+    written — but since this runs alongside retrieval/responding, that
+    guarantee no longer costs tail latency. Extraction reads the USER's
+    message only; the previous answer is context for resolving references
+    (this turn's answer doesn't exist yet — by construction it can never
+    contaminate extraction)."""
+    if store is None:
         return {}
     try:
         t0 = time.perf_counter()
-        question, answer = "", ""
+        question, prev_answer = "", ""
         for msg in reversed(state["messages"]):
-            if not answer and isinstance(msg, AIMessage) and msg.content:
-                answer = str(msg.content)[:400]
+            if not prev_answer and isinstance(msg, AIMessage) and msg.content:
+                prev_answer = str(msg.content)[:400]
             elif isinstance(msg, HumanMessage):
                 question = str(msg.content)
                 break
         if not question:
             return {}
         view = HumanMessage(
-            content=f"USER SAID: {question}\n\nASSISTANT ANSWERED: {answer}"
+            content=(
+                f"PREVIOUS ASSISTANT MESSAGE (context only):\n{prev_answer or '(none)'}\n\n"
+                f"USER SAID: {question}"
+            )
         )
         result = clarifier_llm.with_structured_output(MemoryExtraction).invoke(
             [SystemMessage(content=MEMORY_WRITER_PROMPT + NO_THINK), view]
@@ -481,6 +507,7 @@ def memory_writer(state: ClarifierState, *, store: BaseStore = None):
 
 builder = StateGraph(ClarifierState)
 builder.add_node("reset", reset_turn)
+builder.add_node("memory recall", memory_recall)
 builder.add_node("issue retrieve", issue_retrieve)
 builder.add_node("retriever", ToolNode(TOOLS))
 builder.add_node("clarifier", clarifier_agent)
@@ -489,13 +516,16 @@ builder.add_node("memory writer", memory_writer)
 
 builder.add_edge(START, "reset")
 builder.add_edge("reset", "issue retrieve")
+builder.add_edge("reset", "memory recall")  # parallel branch: hides recall
+# latency under the router LLM call; the superstep barrier joins them
 # "issue retrieve" routes itself via Command: -> "retriever" (normal questions,
 # and requeries with the clarifier's improved_query) or -> "responder agent"
 # (pure small talk, no retrieval).
 builder.add_edge("retriever", "clarifier")
 # "clarifier" routes itself via Command(goto=...) -> "issue retrieve" (requery) or "responder agent"
-builder.add_edge("responder agent", "memory writer")
-builder.add_edge("memory writer", END)
+# "memory writer" has no static edges: the router dispatches it in parallel
+# via Command(goto=[...]) on fact-bearing turns; it dead-ends when done.
+builder.add_edge("responder agent", END)
 
 # Compiled with an in-memory checkpointer; main.py's startup hook replaces it
 # with AsyncPostgresSaver (needs a running event loop) for durable conversations.
