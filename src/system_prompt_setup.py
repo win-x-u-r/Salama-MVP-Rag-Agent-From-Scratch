@@ -42,7 +42,10 @@ BASE_SYSTEM_PROMPT = (
     "specific detail instead of guessing.\n"
     "- Give a clear verdict: which requirements are met, which are not, and the bottom line.\n"
     "- Make sure you normalize the output, for example: golden_visa would become `Golden Visa`\n"
-    "- Answer in the same language the user speaks."
+    "- Follow any standing preferences or instructions recorded in KNOWN USER "
+    "FACTS (preferred language, answer style, how to address the user) — they "
+    "override defaults.\n"
+    "- Otherwise, answer in the same language the user speaks."
 )
 
 
