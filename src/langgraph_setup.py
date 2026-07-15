@@ -174,7 +174,7 @@ ROUTER_PROMPT = (
     "tourist visa' -> 'tourist visa fees'; 'what about the multi entry one?' "
     "-> 'multi entry tourist visa fees').\n"
     "Separately, set shares_personal_facts=true when the latest message states "
-    "ANY lasting information about the user themselves or their circumstances or their preferences "
+    "ANY lasting information about the user themselves or their circumstances or their preferences (including preferred language)"
     "— of any kind whatsoever, not limited to any category. Illustrations "
     "only: their visa status even if temporary ('I have a 30-day tourist "
     "visa' -> true), nationality, family, work, finances, health, travel "
@@ -218,7 +218,7 @@ def _needs_retrieval(state: ClarifierState, query: str) -> tuple[bool, str, bool
     shares_facts = True
     erase = False
     try:
-        decision = clarifier_llm.with_structured_output(RouteDecision).invoke(
+        decision = llm.with_structured_output(RouteDecision).invoke(
             [SystemMessage(content=ROUTER_PROMPT + NO_THINK)] + _router_view(state, query)
         )
         needs = decision.needs_retrieval
