@@ -138,11 +138,15 @@ class RouteDecision(BaseModel):
         "search query for the knowledge base, in the user's language. Resolve "
         "pronouns and references using the previous answer.",
     )
+    # RECALL-BIASED GATE (contract): this flag only decides whether the memory
+    # writer runs; the extractor+reconciler own precision. A false positive
+    # costs seconds of post-stream compute, a false negative loses a fact —
+    # so this must over-trigger, never under-trigger.
     shares_personal_facts: bool = Field(
         default=False,
-        description="true when the LATEST USER MESSAGE states durable personal "
-        "details about the user (nationality, profession, salary, deposits, "
-        "assets, education, family status). Questions alone are false.",
+        description="true when the LATEST USER MESSAGE states ANY lasting "
+        "information about the user themselves or their circumstances — of "
+        "any kind, not limited to any category. When unsure, true.",
     )
     erase_memory: bool = Field(
         default=False,
@@ -170,13 +174,15 @@ ROUTER_PROMPT = (
     "tourist visa' -> 'tourist visa fees'; 'what about the multi entry one?' "
     "-> 'multi entry tourist visa fees').\n"
     "Separately, set shares_personal_facts=true when the latest message states "
-    "personal details or circumstances about the user themselves — their "
-    "current visa/residency situation even if temporary ('I have a 30-day "
-    "tourist visa' -> true), nationality, profession, salary, deposits, assets, "
-    "education, family — INCLUDING when stated inside a question ('I am "
-    "Jordanian, can I enter?' -> true). Merely asking about a topic does NOT "
-    "count, and neither does asking what you remember ('what do you know about "
-    "me?' -> false: recall request, not a disclosure).\n"
+    "ANY lasting information about the user themselves or their circumstances or their preferences "
+    "— of any kind whatsoever, not limited to any category. Illustrations "
+    "only: their visa status even if temporary ('I have a 30-day tourist "
+    "visa' -> true), nationality, family, work, finances, health, travel "
+    "habits, plans. It counts even when stated inside a question ('I am "
+    "Jordanian, can I enter?' -> true). When unsure, choose true — a wasted "
+    "check is cheap, a lost fact is not. Only two things never count: merely "
+    "asking about a topic, and asking what you remember ('what do you know "
+    "about me?' -> false: recall request, not a disclosure).\n"
     "Separately, set erase_memory=true ONLY when the user explicitly asks to "
     "delete, clear, reset, or forget their stored personal details (e.g. "
     "'forget my information', 'delete my data'). Asking WHAT you remember is "
