@@ -234,7 +234,11 @@ def get_profile():
         return {"error": "memory store unavailable"}
     try:
         items = store.search(FACTS_NAMESPACE, limit=100)
-        return {item.key: item.value.get("text") for item in items}
+        items.sort(key=lambda i: i.updated_at, reverse=True)
+        return [
+            {"id": item.key, "text": item.value.get("text"), "updatedAt": str(item.updated_at)}
+            for item in items
+        ]
     except Exception as e:
         logger.error(f"Error reading profile: {e}")
         return {"error": "could not read profile"}

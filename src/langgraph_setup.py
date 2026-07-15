@@ -33,6 +33,7 @@ class ClarifierState(MessagesState):
     improved_query: str  # set by the clarifier on requery; consumed by issue_retrieve
     memory_erased: bool  # facts were wiped this turn -> responder confirms it
     recalled_facts: str  # filled by the parallel memory-recall branch
+    save_facts: bool     # router flagged personal facts -> memory writer runs
 
 
 # ---- clarifier's structured decision (deterministic routing, not free text) ----
@@ -72,6 +73,7 @@ def reset_turn(state: ClarifierState):
         "improved_query": "",
         "memory_erased": False,
         "recalled_facts": "",
+        "save_facts": False,
     }
 
 
@@ -251,7 +253,7 @@ def _erase_facts(store: BaseStore) -> int:
     return len(items)
 
 
-def issue_retrieve(state: ClarifierState, *, store: BaseStore = None) -> Command[Literal["retriever", "responder agent", "memory writer"]]:
+def issue_retrieve(state: ClarifierState, *, store: BaseStore = None) -> Command[Literal["retriever", "responder agent"]]:
     """Issue the retrieval tool call without an LLM — or skip it for small talk.
 
     First pass searches with the user's own words; on requery it uses the
@@ -278,19 +280,13 @@ def issue_retrieve(state: ClarifierState, *, store: BaseStore = None) -> Command
                 logger.info(f"[memory] erased {n} facts by user request")
             except Exception as e:
                 logger.error(f"Error erasing memory: {e}")
-        # early dispatch: the memory writer runs as a PARALLEL branch alongside
-        # retrieval/responding — durable before the run ends, but off the
-        # critical path instead of appended after the responder
-        targets = []
+        # the facts flag gates the post-response memory writer
+        update["save_facts"] = shares_facts
         if needs:
             update["messages"] = [_retrieve_call(query)]
-            targets.append("retriever")
-        else:
-            logger.info("[router] LLM router -> skipping retrieval")
-            targets.append("responder agent")
-        if shares_facts and store is not None:
-            targets.append("memory writer")
-        return Command(goto=targets, update=update)
+            return Command(goto="retriever", update=update)
+        logger.info("[router] LLM router -> skipping retrieval")
+        return Command(goto="responder agent", update=update)
     # requery pass: routing was decided on the first pass this turn
     return Command(goto="retriever", update={"messages": [_retrieve_call(query)]})
 
@@ -430,80 +426,152 @@ def responder_agent(state: ClarifierState):
         return {"messages": [AIMessage(content="An error occurred while compiling your answer, responder agent.")]}
 
 
-# ---- long-term memory writer: runs AFTER the answer has streamed ----
-class MemoryFact(BaseModel):
-    key: str = Field(
-        description="stable snake_case id for the fact type, e.g. 'nationality', "
-        "'bank_deposit_aed', 'profession' — newer values overwrite older ones"
-    )
-    text: str = Field(
-        description="short third-person fact, e.g. 'User is an Indian national'"
-    )
-
-
-class MemoryExtraction(BaseModel):
-    facts: list[MemoryFact] = Field(
+# ---- long-term memory writer: extract -> neighbor search -> reconcile ----
+# Runs after the responder. Memories are FREEFORM sentences (no schema, no
+# category list); consistency comes from the reconciler, not from keys.
+class ExtractedFacts(BaseModel):
+    facts: list[str] = Field(
         default_factory=list,
-        description="durable personal facts the USER stated; empty if none",
+        description="lasting facts about the user as short standalone "
+        "third-person sentences; empty if nothing lasting was shared",
     )
 
 
-MEMORY_WRITER_PROMPT = (
-    "You maintain long-term memory for a UAE visa assistant. From the exchange, "
-    "extract durable personal facts the USER stated about themselves that matter "
-    "for visa services or personalization: current visa/residency status and its "
-    "type, duration or expiry (e.g. 'has a 30-day tourist visa'); whether they "
-    "are inside or outside the UAE; sponsor or employer; nationality, age, "
-    "profession, status (investor/student/employee), salary, bank deposit, "
-    "property value, company investment, education, GPA, family situation — or "
-    "any other durable detail a visa officer would note. Rules:\n"
-    "- Only facts the USER stated about themselves in USER SAID. The previous "
-    "assistant message is context for resolving references (e.g. user answers "
-    "'2 million' to a question about deposits) — never a fact source itself. "
-    "Never store the question topic itself.\n"
-    "- Use a stable snake_case key per fact type (e.g. 'salary_aed', 'nationality') "
-    "so newer values overwrite older ones.\n"
-    "- If no durable personal facts were shared, return an empty list."
+EXTRACT_PROMPT = (
+    "You extract long-term memory for a UAE visa assistant from one exchange.\n"
+    "Source: ONLY what the USER said. Assistant messages are context for "
+    "resolving references (e.g. the user answers '2 million' to the "
+    "assistant's question about deposits) — never a fact source.\n"
+    "Extract lasting facts about the user as short standalone third-person "
+    "sentences, e.g. 'User has 3 brothers'.\n"
+    "Also include logically ENTAILED derivations, with the reasoning in "
+    "parentheses, e.g. 'User has 5 siblings (3 brothers + 2 sisters)'. Only "
+    "strict entailment (arithmetic, category rollups) — never plausible "
+    "guesses.\n"
+    "Skip small talk, one-off questions, and anything about the assistant.\n"
+    "State each distinct fact exactly ONCE — never restate the same fact in "
+    "different words.\n"
+    "Return an empty list if nothing lasting was shared."
 )
 
 
-def memory_writer(state: ClarifierState, *, store: BaseStore = None):
-    """Extracts durable user facts into the store, dispatched by the router as
-    a parallel branch (it never blocks the responder, which doesn't read it).
+class ReconcileDecision(BaseModel):
+    action: Literal["ADD", "UPDATE", "NOOP"] = Field(
+        description="NOOP = already stored; UPDATE = an existing memory is "
+        "contradicted or refined; ADD = genuinely new information"
+    )
+    id: str | None = Field(
+        default=None, description="the existing memory id to rewrite (UPDATE only)"
+    )
+    text: str | None = Field(
+        default=None, description="the memory sentence to store (ADD and UPDATE)"
+    )
 
-    Durable-by-design: the run only reports finished once the facts are
-    written — but since this runs alongside retrieval/responding, that
-    guarantee no longer costs tail latency. Extraction reads the USER's
-    message only; the previous answer is context for resolving references
-    (this turn's answer doesn't exist yet — by construction it can never
-    contaminate extraction)."""
-    if store is None:
+
+class ReconcileDecisions(BaseModel):
+    decisions: list[ReconcileDecision] = Field(default_factory=list)
+
+
+RECONCILE_PROMPT = (
+    "You maintain a user's memory store. For each NEW fact you are given its "
+    "most similar EXISTING memories (with ids). Decide ONE action per new "
+    "fact, in the same order.\n"
+    "Rule: each ATTRIBUTE of the user (their nationality, their salary, their "
+    "sibling count, their visa status, ...) must end up with exactly ONE "
+    "memory row.\n"
+    "- The attribute already has a row with the SAME meaning ('is from "
+    "Jordan' = 'is Jordanian') -> NOOP.\n"
+    "- The attribute already has a row with a DIFFERENT value -> UPDATE: "
+    "return that row's id plus the corrected sentence.\n"
+    "- The attribute has no row at all -> ADD: return the sentence. "
+    "Unrelated existing memories are never a reason to skip an ADD.\n"
+    "An earlier NEW fact in this batch counts as that attribute's row for "
+    "the facts after it.\n"
+    "Exception: a DERIVED/aggregate fact (one with reasoning in parentheses, "
+    "e.g. 'User has 5 siblings (3 brothers + 2 sisters)') is its own "
+    "attribute — never NOOP it against the component facts it derives from."
+)
+
+
+def _extract(question: str, answer: str, prev_answer: str) -> list[str]:
+    """Step 1: freeform fact extraction from this turn's exchange."""
+    view = HumanMessage(
+        content=(
+            f"PREVIOUS ASSISTANT MESSAGE (context only):\n{prev_answer or '(none)'}\n\n"
+            f"USER SAID: {question}\n\n"
+            f"ASSISTANT REPLIED (context only):\n{answer or '(none)'}"
+        )
+    )
+    result = clarifier_llm.with_structured_output(ExtractedFacts).invoke(
+        [SystemMessage(content=EXTRACT_PROMPT + NO_THINK), view]
+    )
+    return [f.strip() for f in result.facts if f and f.strip()]
+
+
+def _reconcile(facts: list[str], store: BaseStore) -> list[str]:
+    """Steps 2+3: neighbor search per fact, one reconciler call, apply.
+
+    Returns a summary of applied actions for logging. Idempotent by design:
+    reprocessing the same facts reconciles to NOOP.
+    """
+    blocks = []
+    for i, text in enumerate(facts):
+        neighbors = store.search(FACTS_NAMESPACE, query=text, limit=4)
+        existing = "\n".join(
+            f"  - id={n.key} :: {n.value.get('text', '')}" for n in neighbors
+        ) or "  (none)"
+        blocks.append(f"NEW FACT {i + 1}: {text}\nEXISTING SIMILAR MEMORIES:\n{existing}")
+    view = HumanMessage(content="\n\n".join(blocks))
+    # the reconciler is the judgment-critical step and runs post-stream where
+    # latency is cheap -> use the main model, not the small one
+    result = llm.with_structured_output(ReconcileDecisions).invoke(
+        [SystemMessage(content=RECONCILE_PROMPT + NO_THINK), view]
+    )
+    applied = []
+    for i, d in enumerate(result.decisions):
+        fallback = facts[i] if i < len(facts) else None
+        text = (d.text or fallback or "").strip()
+        if d.action == "ADD" and text:
+            store.put(FACTS_NAMESPACE, str(uuid4()), {"text": text}, index=["text"])
+            applied.append(f"ADD:{text[:40]}")
+        elif d.action == "UPDATE" and d.id and text:
+            store.put(FACTS_NAMESPACE, d.id, {"text": text}, index=["text"])
+            applied.append(f"UPDATE:{text[:40]}")
+        else:
+            applied.append("NOOP")
+    return applied
+
+
+def memory_writer(state: ClarifierState, *, store: BaseStore = None):
+    """Post-response memory commit: extract freeform facts from this turn's
+    exchange, then reconcile them against existing memories (ADD/UPDATE/NOOP)
+    so the store never accumulates duplicates or contradictions.
+
+    The run only reports finished once memory is durably written; the answer
+    has already streamed by the time this runs. Gated by the router's
+    save_facts flag so ordinary questions pay nothing."""
+    if store is None or not state.get("save_facts"):
         return {}
     try:
         t0 = time.perf_counter()
-        question, prev_answer = "", ""
+        question, answer, prev_answer = "", "", ""
         for msg in reversed(state["messages"]):
-            if not prev_answer and isinstance(msg, AIMessage) and msg.content:
-                prev_answer = str(msg.content)[:400]
-            elif isinstance(msg, HumanMessage):
+            if not question and isinstance(msg, AIMessage) and msg.content and not answer:
+                answer = str(msg.content)[:400]
+            elif isinstance(msg, HumanMessage) and not question:
                 question = str(msg.content)
+            elif question and isinstance(msg, AIMessage) and msg.content:
+                prev_answer = str(msg.content)[:400]
                 break
         if not question:
             return {}
-        view = HumanMessage(
-            content=(
-                f"PREVIOUS ASSISTANT MESSAGE (context only):\n{prev_answer or '(none)'}\n\n"
-                f"USER SAID: {question}"
-            )
-        )
-        result = clarifier_llm.with_structured_output(MemoryExtraction).invoke(
-            [SystemMessage(content=MEMORY_WRITER_PROMPT + NO_THINK), view]
-        )
-        for f in result.facts:
-            store.put(FACTS_NAMESPACE, f.key, {"text": f.text}, index=["text"])
+        facts = _extract(question, answer, prev_answer)
+        if not facts:
+            logger.info(f"[timing] memory writer: {time.perf_counter() - t0:.2f}s | no facts")
+            return {}
+        applied = _reconcile(facts, store)
         logger.info(
-            f"[timing] memory writer: {time.perf_counter() - t0:.2f}s "
-            f"| facts={[f.key for f in result.facts]}"
+            f"[timing] memory writer: {time.perf_counter() - t0:.2f}s | {applied}"
         )
     except Exception as e:
         logger.error(f"Error in memory writer: {e}")
@@ -528,9 +596,9 @@ builder.add_edge("reset", "memory recall")  # parallel branch: hides recall
 # (pure small talk, no retrieval).
 builder.add_edge("retriever", "clarifier")
 # "clarifier" routes itself via Command(goto=...) -> "issue retrieve" (requery) or "responder agent"
-# "memory writer" has no static edges: the router dispatches it in parallel
-# via Command(goto=[...]) on fact-bearing turns; it dead-ends when done.
-builder.add_edge("responder agent", END)
+# memory commit happens after the answer has streamed; gated by save_facts
+builder.add_edge("responder agent", "memory writer")
+builder.add_edge("memory writer", END)
 
 # Compiled with an in-memory checkpointer; main.py's startup hook replaces it
 # with AsyncPostgresSaver (needs a running event loop) for durable conversations.
