@@ -384,30 +384,177 @@ button.icon:hover {
   font-size: 12px;
 }
 
+/* Explicit colors (like .svc-*): CopilotKit's message container redefines
+   theme variables, which washed this chip out to near-invisible. */
 .tool-chip {
   display: inline-block;
-  padding: 6px 12px;
+  padding: 5px 12px;
   margin: 4px 0;
-  border: 1px solid var(--border);
+  border: 1px solid rgba(255, 255, 255, 0.09);
   border-radius: 999px;
-  background: var(--panel);
-  color: var(--muted);
-  font-size: 13px;
+  background: #1e2330;
+  color: #aab1c2;
+  font-size: 12px;
 }
 
-.muted {
-  color: var(--muted);
+/* ---- service panel (generative UI): ledger-sheet record ----
+   One continuous surface with a left label rail and hairline dividers —
+   structure from alignment, not boxes. Colors are explicit (not theme vars)
+   because CopilotKit's message container redefines variables like --accent. */
+.svc-panel {
+  --svc-text: #e8eaf1;
+  --svc-dim: #aab1c2;
+  --svc-faint: #838a9c;
+  --svc-line: rgba(255, 255, 255, 0.08);
+  --svc-accent: #3b82f6;
+  margin: 12px 0 4px;
+  padding: 12px 16px;
+  background: #1e2330;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 12px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--svc-text);
 }
 
-.error {
-  color: var(--danger);
+.svc-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding-bottom: 9px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.14);
 }
 
-@media (max-width: 720px) {
-  .profile-panel {
-    position: fixed;
-    inset: 0;
-    width: auto;
-    z-index: 10;
+.svc-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--svc-text);
+}
+
+.svc-crumb {
+  font-size: 11px;
+  color: var(--svc-faint);
+}
+
+.svc-sheet {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+}
+
+.svc-k {
+  padding: 9px 12px 9px 0;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--svc-faint);
+  border-top: 1px solid var(--svc-line);
+  white-space: nowrap;
+}
+
+.svc-vcell {
+  padding: 9px 0;
+  color: var(--svc-dim);
+  border-top: 1px solid var(--svc-line);
+  min-width: 0;
+}
+
+.svc-k:first-child,
+.svc-k:first-child + .svc-vcell {
+  border-top: none;
+}
+
+.svc-fees {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.svc-fee-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.svc-fee-name {
+  color: var(--svc-dim);
+  min-width: 0;
+}
+
+.svc-amount {
+  white-space: nowrap;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--svc-text);
+}
+
+.svc-varies {
+  color: var(--svc-dim);
+  font-weight: 400;
+  font-style: italic;
+}
+
+.svc-pill {
+  display: inline-block;
+  margin-inline-start: 6px;
+  padding: 0 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 500;
+  vertical-align: 1px;
+  background: rgba(59, 130, 246, 0.18);
+  color: #a8c4f9;
+  white-space: nowrap;
+}
+
+.svc-inline-section + .svc-inline-section {
+  margin-top: 5px;
+}
+
+.svc-route {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--svc-text);
+}
+
+.svc-sep {
+  color: var(--svc-faint);
+}
+
+.svc-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 2px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.14);
+  font-size: 10.5px;
+  color: var(--svc-faint);
+}
+
+.svc-footer a {
+  color: var(--svc-accent);
+  text-decoration: none;
+}
+
+.svc-footer a:hover {
+  text-decoration: underline;
+}
+
+@media (max-width: 480px) {
+  .svc-sheet {
+    grid-template-columns: 1fr;
+  }
+  .svc-k {
+    padding-bottom: 2px;
+  }
+  .svc-vcell {
+    border-top: none;
+    padding-top: 0;
   }
 }

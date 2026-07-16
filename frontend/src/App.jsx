@@ -8,6 +8,7 @@ import { HttpAgent } from "@ag-ui/client";
 import { Observable } from "rxjs";
 import ProfilePanel from "./components/ProfilePanel.jsx";
 import Sidebar from "./components/Sidebar.jsx";
+import ServicePanel from "./components/ServicePanel.jsx";
 
 // CopilotKit calls agent.connect() when it attaches to a thread, expecting a
 // history replay (stock HttpAgent doesn't implement it). We replay the thread's
@@ -35,19 +36,24 @@ class ThreadAgent extends HttpAgent {
 }
 
 // Without a registered renderer, CopilotChat falls back to dumping tool calls
-// and their raw results as text. Render `retrieve` as a compact chip and hide
-// anything else.
+// and their raw results as text. Render `retrieve` as a compact chip, the
+// service panel as its card template, and hide anything else.
 const toolCallRenderer = defineToolCallRenderer({
   name: "*",
-  render: ({ name, args, status }) =>
-    name === "retrieve" ? (
-      <div className="tool-chip">
-        {status === "complete" ? "🔎 Searched" : "🔎 Searching"}
-        {args?.query ? `: ${args.query}` : "…"}
-      </div>
-    ) : (
-      <></>
-    ),
+  render: ({ name, args, status }) => {
+    if (name === "retrieve") {
+      return (
+        <div className="tool-chip">
+          {status === "complete" ? "🔎 Searched" : "🔎 Searching"}
+          {args?.query ? `: ${args.query}` : "…"}
+        </div>
+      );
+    }
+    if (name === "show_service_panel") {
+      return <ServicePanel data={args} />;
+    }
+    return <></>;
+  },
 });
 
 // Direct browser -> AG-UI connection (no CopilotKit runtime server). Each
