@@ -15,6 +15,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from .backend_setup import llm, clarifier_llm, store as memory_store
 from .tools_setup import TOOLS
 from .system_prompt_setup import build_system_prompt, NO_THINK
+from .service_panel import service_panel, PANEL_TOOL_NAME
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -373,7 +374,13 @@ def clarifier_agent(state: ClarifierState) -> Command[Literal["issue retrieve", 
 
 
 def _recall_facts(store: BaseStore | None, state: ClarifierState) -> str | None:
-    """Semantic recall: the top facts relevant to the current question."""
+    """Two-lane recall.
+
+    Lane 1 — standing preferences: ALWAYS injected, no semantic matching
+    (they're relevant to every turn but semantically near no query). A plain
+    filtered lookup, no embedding call.
+    Lane 2 — facts: semantic top-K against the current question, as before.
+    """
     if store is None:
         return None
     try:
@@ -383,13 +390,27 @@ def _recall_facts(store: BaseStore | None, state: ClarifierState) -> str | None:
             if isinstance(msg, HumanMessage):
                 question = str(msg.content)
                 break
+        prefs = store.search(FACTS_NAMESPACE, filter={"kind": "preference"}, limit=20)
         hits = store.search(FACTS_NAMESPACE, query=question or None, limit=5)
+        pref_keys = {p.key for p in prefs}
+        fact_hits = [h for h in hits if h.key not in pref_keys]
         logger.info(
-            f"[timing] memory recall: {time.perf_counter() - t0:.2f}s | hits={len(hits)}"
+            f"[timing] memory recall: {time.perf_counter() - t0:.2f}s "
+            f"| prefs={len(prefs)} facts={len(fact_hits)}"
         )
-        if not hits:
+        if not prefs and not fact_hits:
             return None
-        return "\n".join(f"- {h.value.get('text', '')}" for h in hits)
+        sections = []
+        if prefs:
+            sections.append(
+                "STANDING PREFERENCES (always follow):\n"
+                + "\n".join(f"- {p.value.get('text', '')}" for p in prefs)
+            )
+        if fact_hits:
+            sections.append(
+                "FACTS:\n" + "\n".join(f"- {h.value.get('text', '')}" for h in fact_hits)
+            )
+        return "\n\n".join(sections)
     except Exception as e:
         logger.error(f"Error recalling memories: {e}")
         return None
@@ -399,6 +420,24 @@ def memory_recall(state: ClarifierState, *, store: BaseStore = None):
     """Parallel branch off `reset`: fetches relevant facts concurrently with the
     router, so recall costs nothing on the responder's critical path."""
     return {"recalled_facts": _recall_facts(store, state) or ""}
+
+
+def _llm_view(messages: list) -> list:
+    """History minus panel tool-call pairs — panels are UI artifacts assembled
+    from the same passages the LLM already sees; replaying their JSON payloads
+    into the context every turn is pure token cost."""
+    out = []
+    for m in messages:
+        if (
+            isinstance(m, AIMessage)
+            and m.tool_calls
+            and all(tc["name"] == PANEL_TOOL_NAME for tc in m.tool_calls)
+        ):
+            continue
+        if isinstance(m, ToolMessage) and getattr(m, "name", None) == PANEL_TOOL_NAME:
+            continue
+        out.append(m)
+    return out
 
 
 def responder_agent(state: ClarifierState):
@@ -421,7 +460,7 @@ def responder_agent(state: ClarifierState):
                 "Do NOT attempt an answer. Instead, ask ONE short, specific clarifying question to "
                 "get the missing detail (e.g. which visa type, their nationality, status, or assets)."
             )
-        payload = [SystemMessage(content=prompt)] + state["messages"]
+        payload = [SystemMessage(content=prompt)] + _llm_view(state["messages"])
         response = llm.invoke(payload)
         # token counts come free & exact from the provider's response;
         # get_num_tokens_from_messages cost ~1.7s of GPT-2 tokenizing per turn
@@ -439,11 +478,22 @@ def responder_agent(state: ClarifierState):
 # ---- long-term memory writer: extract -> neighbor search -> reconcile ----
 # Runs after the responder. Memories are FREEFORM sentences (no schema, no
 # category list); consistency comes from the reconciler, not from keys.
+class ExtractedMemory(BaseModel):
+    text: str = Field(
+        description="short standalone third-person sentence, e.g. 'User has "
+        "3 brothers' or 'User wants the assistant to speak Arabic'"
+    )
+    kind: Literal["fact", "preference"] = Field(
+        description="'preference' = a standing instruction for how the "
+        "assistant should behave (language, format, style, how to address "
+        "the user); 'fact' = information about the user or their circumstances"
+    )
+
+
 class ExtractedFacts(BaseModel):
-    facts: list[str] = Field(
+    facts: list[ExtractedMemory] = Field(
         default_factory=list,
-        description="lasting facts about the user as short standalone "
-        "third-person sentences; empty if nothing lasting was shared",
+        description="memories worth keeping; empty if nothing lasting was shared",
     )
 
 
@@ -470,6 +520,8 @@ EXTRACT_PROMPT = (
     "one-off; 'speak Arabic from now on' is standing).\n"
     "State each distinct memory exactly ONCE — never restate the same one in "
     "different words.\n"
+    "Tag each memory's kind: 'preference' for standing instructions about how "
+    "the assistant should behave; 'fact' for everything else.\n"
     "Return an empty list if nothing passes the test."
 )
 
@@ -524,22 +576,24 @@ def _extract(question: str, answer: str, prev_answer: str) -> list[str]:
     result = clarifier_llm.with_structured_output(ExtractedFacts).invoke(
         [SystemMessage(content=EXTRACT_PROMPT + NO_THINK), view]
     )
-    return [f.strip() for f in result.facts if f and f.strip()]
+    return [f for f in result.facts if f.text and f.text.strip()]
 
 
-def _reconcile(facts: list[str], store: BaseStore) -> list[str]:
+def _reconcile(facts: list[ExtractedMemory], store: BaseStore) -> list[str]:
     """Steps 2+3: neighbor search per fact, one reconciler call, apply.
 
     Returns a summary of applied actions for logging. Idempotent by design:
-    reprocessing the same facts reconciles to NOOP.
+    reprocessing the same facts reconciles to NOOP. The memory's kind
+    (fact/preference) travels with it through ADD and UPDATE so preferences
+    never silently degrade into facts.
     """
     blocks = []
-    for i, text in enumerate(facts):
-        neighbors = store.search(FACTS_NAMESPACE, query=text, limit=4)
+    for i, f in enumerate(facts):
+        neighbors = store.search(FACTS_NAMESPACE, query=f.text, limit=4)
         existing = "\n".join(
             f"  - id={n.key} :: {n.value.get('text', '')}" for n in neighbors
         ) or "  (none)"
-        blocks.append(f"NEW FACT {i + 1}: {text}\nEXISTING SIMILAR MEMORIES:\n{existing}")
+        blocks.append(f"NEW FACT {i + 1}: {f.text}\nEXISTING SIMILAR MEMORIES:\n{existing}")
     view = HumanMessage(content="\n\n".join(blocks))
     # the reconciler is the judgment-critical step and runs post-stream where
     # latency is cheap -> use the main model, not the small one
@@ -548,14 +602,15 @@ def _reconcile(facts: list[str], store: BaseStore) -> list[str]:
     )
     applied = []
     for i, d in enumerate(result.decisions):
-        fallback = facts[i] if i < len(facts) else None
-        text = (d.text or fallback or "").strip()
+        source = facts[i] if i < len(facts) else None
+        text = (d.text or (source.text if source else "")).strip()
+        kind = source.kind if source else "fact"
         if d.action == "ADD" and text:
-            store.put(FACTS_NAMESPACE, str(uuid4()), {"text": text}, index=["text"])
-            applied.append(f"ADD:{text[:40]}")
+            store.put(FACTS_NAMESPACE, str(uuid4()), {"text": text, "kind": kind}, index=["text"])
+            applied.append(f"ADD[{kind}]:{text[:40]}")
         elif d.action == "UPDATE" and d.id and text:
-            store.put(FACTS_NAMESPACE, d.id, {"text": text}, index=["text"])
-            applied.append(f"UPDATE:{text[:40]}")
+            store.put(FACTS_NAMESPACE, d.id, {"text": text, "kind": kind}, index=["text"])
+            applied.append(f"UPDATE[{kind}]:{text[:40]}")
         else:
             applied.append("NOOP")
     return applied
@@ -604,6 +659,7 @@ builder.add_node("issue retrieve", issue_retrieve)
 builder.add_node("retriever", ToolNode(TOOLS))
 builder.add_node("clarifier", clarifier_agent)
 builder.add_node("responder agent", responder_agent)
+builder.add_node("service panel", service_panel)
 builder.add_node("memory writer", memory_writer)
 
 builder.add_edge(START, "reset")
@@ -615,8 +671,10 @@ builder.add_edge("reset", "memory recall")  # parallel branch: hides recall
 # (pure small talk, no retrieval).
 builder.add_edge("retriever", "clarifier")
 # "clarifier" routes itself via Command(goto=...) -> "issue retrieve" (requery) or "responder agent"
-# memory commit happens after the answer has streamed; gated by save_facts
-builder.add_edge("responder agent", "memory writer")
+# panel attaches after the answer (deterministic, no LLM), then memory commit;
+# both run post-stream so neither costs visible latency
+builder.add_edge("responder agent", "service panel")
+builder.add_edge("service panel", "memory writer")
 builder.add_edge("memory writer", END)
 
 # Compiled with an in-memory checkpointer; main.py's startup hook replaces it

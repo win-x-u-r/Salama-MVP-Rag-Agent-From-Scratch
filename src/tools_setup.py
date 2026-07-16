@@ -10,8 +10,10 @@ from .config import RETRIEVAL_K, RERANKER_TOP_N
 logger = logging.getLogger("uvicorn.error")
 
 #retrieving tool
-@tool
-def retrieve(query: str) -> str:
+# content_and_artifact: the passages remain the tool result the LLM sees; the
+# artifact carries the matched services' names/scores for the panel node.
+@tool(response_format="content_and_artifact")
+def retrieve(query: str):
     """Search the knowledge base and return relevant passages.
 
     Args:
@@ -45,10 +47,17 @@ def retrieve(query: str) -> str:
         compressed_docs = FastEmbedRerank(top_n=RERANKER_TOP_N).compress_documents(retrieved_docs, query)
         logger.info(f"Compressed to {len(compressed_docs)} documents for query: {query},\n [timing] Reranking: {time.perf_counter()-t0:.2f}s")
         logger.info(f"Documents retrieved and compressed successfully with k={k} and top_n={topN}")
-        return [d.page_content for d in compressed_docs]
+        artifact = {
+            "services": [
+                {"name": d.metadata.get("name"), "score": d.metadata.get("score")}
+                for d in compressed_docs
+                if d.metadata.get("name")
+            ]
+        }
+        return [d.page_content for d in compressed_docs], artifact
     except Exception as e:
         logger.error(f"Error retrieving documents: {e}")
-        return "An error occurred while retrieving documents."
+        return "An error occurred while retrieving documents.", {}
 
 
 # Long-term memory now lives in the Postgres store (see backend_setup.py):

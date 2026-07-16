@@ -7,7 +7,7 @@ from ag_ui_langgraph import LangGraphAgent, add_langgraph_fastapi_endpoint
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
@@ -215,15 +215,39 @@ async def delete_thread(thread_id: str):
 
 @app.get("/threads/{thread_id}/messages")
 async def thread_messages(thread_id: str):
-    """Visible message history for a thread (user + assistant text only)."""
+    """Visible message history for a thread, in AG-UI message format.
+
+    Tool calls are included so registered renderers (retrieve chip, service
+    panel) re-render on thread switch; tool RESULTS are truncated — renderers
+    only read the call args, and retrieval results are whole passage dumps."""
     state = await graph.aget_state({"configurable": {"thread_id": thread_id}})
     msgs = state.values.get("messages", []) if state and state.values else []
     out = []
     for m in msgs:
         if isinstance(m, HumanMessage):
             out.append({"id": m.id or f"u{len(out)}", "role": "user", "content": str(m.content)})
-        elif isinstance(m, AIMessage) and m.content:
-            out.append({"id": m.id or f"a{len(out)}", "role": "assistant", "content": str(m.content)})
+        elif isinstance(m, AIMessage):
+            entry = {"id": m.id or f"a{len(out)}", "role": "assistant"}
+            if m.content:
+                entry["content"] = str(m.content)
+            if m.tool_calls:
+                entry["toolCalls"] = [
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {"name": tc["name"], "arguments": json.dumps(tc["args"])},
+                    }
+                    for tc in m.tool_calls
+                ]
+            if m.content or m.tool_calls:
+                out.append(entry)
+        elif isinstance(m, ToolMessage):
+            out.append({
+                "id": m.id or f"t{len(out)}",
+                "role": "tool",
+                "toolCallId": m.tool_call_id,
+                "content": str(m.content)[:200],
+            })
     return out
 
 
@@ -236,7 +260,8 @@ def get_profile():
         items = store.search(FACTS_NAMESPACE, limit=100)
         items.sort(key=lambda i: i.updated_at, reverse=True)
         return [
-            {"id": item.key, "text": item.value.get("text"), "updatedAt": str(item.updated_at)}
+            {"id": item.key, "text": item.value.get("text"),
+             "kind": item.value.get("kind", "fact"), "updatedAt": str(item.updated_at)}
             for item in items
         ]
     except Exception as e:
