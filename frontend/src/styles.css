@@ -558,3 +558,158 @@ button.icon:hover {
     padding-top: 0;
   }
 }
+
+/* ---- service comparison (generative UI): two-service bar chart ----
+   Inherits the .svc-panel card shell. Series colors #3b82f6 / #d97706 are
+   CVD-validated for this dark surface (dataviz six-checks). */
+.svc-cmp-caption {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--svc-faint);
+  margin-bottom: 10px;
+}
+
+.svc-cmp-series + .svc-cmp-series {
+  margin-top: 12px;
+}
+
+.svc-cmp-legend {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 6px;
+}
+
+.svc-cmp-swatch {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+.svc-cmp-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--svc-text);
+}
+
+.svc-cmp-charts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+
+@media (max-width: 560px) {
+  .svc-cmp-charts {
+    grid-template-columns: 1fr;
+  }
+}
+
+.svc-cmp-plot {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.18);
+  padding-bottom: 0;
+}
+
+.svc-cmp-col {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  height: 100%;
+}
+
+.svc-cmp-colvalue {
+  font-size: 10.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--svc-text);
+  margin-bottom: 3px;
+  white-space: nowrap;
+}
+
+.svc-cmp-vbar {
+  display: block;
+  width: 68%;
+  max-width: 34px;
+  border-radius: 4px 4px 0 0;
+}
+
+.svc-cmp-collabel {
+  margin-top: 5px;
+  font-size: 10px;
+  line-height: 1.25;
+  color: var(--svc-faint);
+  text-align: center;
+  height: 26px;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  word-break: break-word;
+}
+
+.svc-cmp-total {
+  margin-top: 8px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--svc-text);
+}
+
+.svc-cmp-note {
+  font-size: 11px;
+  color: var(--svc-faint);
+  font-style: italic;
+  padding-inline-start: 16px;
+  margin-top: 2px;
+}
+
+.svc-cmp-facts {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 12px;
+  font-size: 12px;
+}
+
+.svc-cmp-facts th {
+  text-align: start;
+  padding: 4px 8px 4px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.14);
+}
+
+.svc-cmp-facts td {
+  padding: 5px 8px 5px 0;
+  border-bottom: 1px solid var(--svc-line);
+  color: var(--svc-dim);
+  vertical-align: top;
+}
+
+.svc-cmp-facts tr:last-child td {
+  border-bottom: none;
+}
+
+.svc-cmp-facts-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--svc-faint);
+  white-space: nowrap;
+}
+
+.svc-cmp-links {
+  display: flex;
+  gap: 12px;
+}
+
+.svc-cmp-links a {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}

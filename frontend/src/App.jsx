@@ -9,6 +9,7 @@ import { Observable } from "rxjs";
 import ProfilePanel from "./components/ProfilePanel.jsx";
 import Sidebar from "./components/Sidebar.jsx";
 import ServicePanel from "./components/ServicePanel.jsx";
+import ServiceComparison from "./components/ServiceComparison.jsx";
 
 // CopilotKit calls agent.connect() when it attaches to a thread, expecting a
 // history replay (stock HttpAgent doesn't implement it). We replay the thread's
@@ -51,6 +52,9 @@ const toolCallRenderer = defineToolCallRenderer({
     }
     if (name === "show_service_panel") {
       return <ServicePanel data={args} />;
+    }
+    if (name === "show_service_comparison") {
+      return <ServiceComparison data={args} />;
     }
     return <></>;
   },

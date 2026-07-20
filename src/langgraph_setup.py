@@ -15,7 +15,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from .backend_setup import llm, clarifier_llm, store as memory_store
 from .tools_setup import TOOLS
 from .system_prompt_setup import build_system_prompt, NO_THINK
-from .service_panel import service_panel, PANEL_TOOL_NAME
+from .service_panel import service_panel, PANEL_TOOL_NAME, COMPARE_TOOL_NAME
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -35,6 +35,9 @@ class ClarifierState(MessagesState):
     memory_erased: bool  # facts were wiped this turn -> responder confirms it
     recalled_facts: str  # filled by the parallel memory-recall branch
     save_facts: bool     # router flagged personal facts -> memory writer runs
+    compare_services: bool  # router flagged a comparative question -> panel node
+                            # may emit a two-service comparison chart
+    compare_targets: list   # the two compared services as search phrases
 
 
 # ---- clarifier's structured decision (deterministic routing, not free text) ----
@@ -75,6 +78,8 @@ def reset_turn(state: ClarifierState):
         "memory_erased": False,
         "recalled_facts": "",
         "save_facts": False,
+        "compare_services": False,
+        "compare_targets": [],
     }
 
 
@@ -156,6 +161,21 @@ class RouteDecision(BaseModel):
         "or forget their stored personal information. Asking what is "
         "remembered is false.",
     )
+    compare_services: bool = Field(
+        default=False,
+        description="true when the LATEST USER MESSAGE asks to COMPARE two "
+        "different visa/residency services against each other (difference "
+        "between X and Y, X versus Y, which of X or Y is cheaper/faster). "
+        "Asking about a single service, or about options WITHIN one service "
+        "(e.g. 30 vs 60 days of the same visa), is false.",
+    )
+    compare_targets: list[str] = Field(
+        default_factory=list,
+        description="when compare_services is true: the TWO services being "
+        "compared, each as its own short standalone search phrase (e.g. "
+        "['golden visa for investors', 'green visa self-employment']). "
+        "Empty otherwise.",
+    )
 
 
 ROUTER_PROMPT = (
@@ -211,17 +231,21 @@ def _router_view(state: ClarifierState, latest: str) -> list:
     ]
 
 
-def _needs_retrieval(state: ClarifierState, query: str) -> tuple[bool, str, bool, bool]:
-    """Returns (needs_retrieval, search_query, shares_facts, erase_memory).
+def _needs_retrieval(state: ClarifierState, query: str):
+    """Returns (needs_retrieval, search_query, shares_facts, erase_memory,
+    compare, compare_targets).
 
-    Fails open to (True, verbatim, True, False): on router errors we'd rather
-    waste a retrieval than lose an answer or a fact — but never erase by
-    accident.
+    Fails open to (True, verbatim, True, False, False, []): on router errors
+    we'd rather waste a retrieval than lose an answer or a fact — but never
+    erase by accident, and a missed comparison just falls back to a single
+    panel.
     """
     t0 = time.perf_counter()
     search_query = query
     shares_facts = True
     erase = False
+    compare = False
+    targets: list[str] = []
     try:
         decision = llm.with_structured_output(RouteDecision).invoke(
             [SystemMessage(content=ROUTER_PROMPT + NO_THINK)] + _router_view(state, query)
@@ -229,6 +253,8 @@ def _needs_retrieval(state: ClarifierState, query: str) -> tuple[bool, str, bool
         needs = decision.needs_retrieval
         shares_facts = decision.shares_personal_facts
         erase = decision.erase_memory
+        compare = decision.compare_services
+        targets = [t.strip() for t in (decision.compare_targets or []) if t and t.strip()]
         if needs and decision.search_query and decision.search_query.strip():
             search_query = decision.search_query.strip()
     except Exception as e:
@@ -239,8 +265,9 @@ def _needs_retrieval(state: ClarifierState, query: str) -> tuple[bool, str, bool
         + (f" | query={search_query!r}" if needs else "")
         + f" | facts={shares_facts}"
         + (" | ERASE" if erase else "")
+        + (f" | COMPARE {targets}" if compare else "")
     )
-    return needs, search_query, shares_facts, erase
+    return needs, search_query, shares_facts, erase, compare, targets
 
 
 def _retrieve_call(query: str) -> AIMessage:
@@ -281,8 +308,8 @@ def issue_retrieve(state: ClarifierState, *, store: BaseStore = None) -> Command
         # if _skip_retrieval(query):
         #     logger.info("[router] small talk / meta question -> skipping retrieval")
         #     return Command(goto="responder agent")
-        needs, query, shares_facts, erase = _needs_retrieval(state, query)
-        update = {}
+        needs, query, shares_facts, erase, compare, targets = _needs_retrieval(state, query)
+        update = {"compare_services": compare, "compare_targets": targets}
         if erase and store is not None:
             try:
                 n = _erase_facts(store)
@@ -422,19 +449,22 @@ def memory_recall(state: ClarifierState, *, store: BaseStore = None):
     return {"recalled_facts": _recall_facts(store, state) or ""}
 
 
+_UI_TOOL_NAMES = {PANEL_TOOL_NAME, COMPARE_TOOL_NAME}
+
+
 def _llm_view(messages: list) -> list:
-    """History minus panel tool-call pairs — panels are UI artifacts assembled
-    from the same passages the LLM already sees; replaying their JSON payloads
-    into the context every turn is pure token cost."""
+    """History minus panel/comparison tool-call pairs — they are UI artifacts
+    assembled from the same passages the LLM already sees; replaying their JSON
+    payloads into the context every turn is pure token cost."""
     out = []
     for m in messages:
         if (
             isinstance(m, AIMessage)
             and m.tool_calls
-            and all(tc["name"] == PANEL_TOOL_NAME for tc in m.tool_calls)
+            and all(tc["name"] in _UI_TOOL_NAMES for tc in m.tool_calls)
         ):
             continue
-        if isinstance(m, ToolMessage) and getattr(m, "name", None) == PANEL_TOOL_NAME:
+        if isinstance(m, ToolMessage) and getattr(m, "name", None) in _UI_TOOL_NAMES:
             continue
         out.append(m)
     return out
