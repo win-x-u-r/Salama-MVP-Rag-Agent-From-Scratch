@@ -90,6 +90,10 @@ COMPOSER_PROMPT = (
     '{"root": {"type": "panel", "props": {...}, "children": [{"type": ..., '
     '"props": {...}, "children": [...]}, ...]}}\n\n'
     "Hard rules:\n"
+    "- If the user EXPLICITLY asked for a chart type (pie, donut, bar, table, "
+    "timeline...), you MUST include that component when the data allows it — "
+    "the user's requested form wins over your own preference. A donut request "
+    "is piechart with donut: true.\n"
     "- Every number, fee, document name, and URL must be copied VERBATIM from "
     "the records. Never invent, round, or total numbers yourself unless the "
     "record provides the total.\n"
