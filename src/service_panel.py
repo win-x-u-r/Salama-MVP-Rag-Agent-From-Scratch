@@ -20,6 +20,11 @@ logger = logging.getLogger("uvicorn.error")
 
 PANEL_TOOL_NAME = "show_service_panel"
 COMPARE_TOOL_NAME = "show_service_comparison"
+
+# "fixed" = deterministic templates (panel/comparison); "dynamic" = an LLM
+# composes a component tree from a catalog (see dynamic_ui.py), falling back
+# to the fixed templates when composition fails.
+PANEL_UI_MODE = os.getenv("PANEL_UI_MODE", "dynamic").lower()
 # Neo4j cosine score of the top vector hit must clear this for a panel to show;
 # tune via env after watching the logged scores for real queries.
 PANEL_MIN_SCORE = float(os.getenv("PANEL_MIN_SCORE", "0.60"))
@@ -222,6 +227,44 @@ def _resolve_compare_targets(targets: list[str]) -> list[dict]:
     return resolved
 
 
+def _try_dynamic(state, services: list[dict]):
+    """Dynamic-schema path: hand the resolved records to the LLM composer.
+    Returns an emission dict, or None to fall back to fixed templates."""
+    from .dynamic_ui import compose_tree, DYNAMIC_TOOL_NAME
+
+    # Records: resolved compare targets when comparing, else confident top hits.
+    records: list[dict] = []
+    if state.get("compare_services"):
+        records = _resolve_compare_targets(state.get("compare_targets") or [])
+    if not records:
+        for s in services[:2]:
+            rec = RECORDS_BY_NAME.get(s.get("name"))
+            if rec is not None and (s.get("score") or 0.0) >= PANEL_MIN_SCORE:
+                if all(r["name"] != rec["name"] for r in records):
+                    records.append(rec)
+        if not state.get("compare_services"):
+            records = records[:1]
+    if not records:
+        return None
+
+    question = answer = ""
+    for msg in reversed(state["messages"]):
+        if not answer and isinstance(msg, AIMessage) and msg.content:
+            answer = str(msg.content)
+        if isinstance(msg, HumanMessage):
+            question = str(msg.content)
+            break
+
+    payloads = [
+        {**build_panel_payload(r), "fees": _comparison_entry(r)["fees"]}
+        for r in records
+    ]
+    tree = compose_tree(question, answer, payloads)
+    if tree is None:
+        return None
+    return _emit(DYNAMIC_TOOL_NAME, {"tree": tree}, "dyn")
+
+
 def _emit(tool_name: str, payload: dict, prefix: str) -> dict:
     call_id = f"{prefix}-{uuid4().hex[:8]}"
     return {
@@ -259,6 +302,13 @@ def service_panel(state):
                 f"[panel] skip: top hit {name!r} score {score:.3f} < {PANEL_MIN_SCORE}"
             )
             return {}
+
+        # Dynamic mode: an LLM composes a component tree from the resolved
+        # records; any failure falls through to the fixed templates below.
+        if PANEL_UI_MODE == "dynamic":
+            emitted = _try_dynamic(state, services)
+            if emitted is not None:
+                return emitted
 
         # Comparison path: resolve EACH named target with its own vector search
         # (top-2 of one blended query often returns two flavors of the same

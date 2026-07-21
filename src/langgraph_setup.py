@@ -16,6 +16,7 @@ from .backend_setup import llm, clarifier_llm, store as memory_store
 from .tools_setup import TOOLS
 from .system_prompt_setup import build_system_prompt, NO_THINK
 from .service_panel import service_panel, PANEL_TOOL_NAME, COMPARE_TOOL_NAME
+from .dynamic_ui import DYNAMIC_TOOL_NAME
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -449,7 +450,7 @@ def memory_recall(state: ClarifierState, *, store: BaseStore = None):
     return {"recalled_facts": _recall_facts(store, state) or ""}
 
 
-_UI_TOOL_NAMES = {PANEL_TOOL_NAME, COMPARE_TOOL_NAME}
+_UI_TOOL_NAMES = {PANEL_TOOL_NAME, COMPARE_TOOL_NAME, DYNAMIC_TOOL_NAME}
 
 
 def _llm_view(messages: list) -> list:

@@ -713,3 +713,450 @@ button.icon:hover {
   align-items: center;
   gap: 4px;
 }
+
+/* ---- dynamic-schema generative UI (DynamicUI.jsx) ----
+   Component library the LLM composes from. Same scoped-color discipline as
+   .svc-*: CopilotKit's container redefines theme vars, so colors are explicit. */
+.dyn-root {
+  --dyn-text: #e8eaf1;
+  --dyn-dim: #aab1c2;
+  --dyn-faint: #838a9c;
+  --dyn-line: rgba(255, 255, 255, 0.08);
+  --dyn-accent: #3b82f6;
+  margin: 12px 0 4px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--dyn-text);
+}
+
+.dyn-panel {
+  background: #1e2330;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 12px;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.dyn-panel-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.14);
+}
+
+.dyn-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.dyn-subtitle {
+  font-size: 11px;
+  color: var(--dyn-faint);
+}
+
+.dyn-card {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--dyn-line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.dyn-card-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--dyn-line);
+}
+
+.dyn-columns {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 10px;
+  align-items: start;
+}
+
+.dyn-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.dyn-section-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--dyn-faint);
+}
+
+.dyn-heading {
+  font-weight: 600;
+}
+.dyn-h1 { font-size: 15px; }
+.dyn-h2 { font-size: 13.5px; }
+.dyn-h3 { font-size: 12.5px; }
+
+.dyn-text {
+  margin: 0;
+  color: var(--dyn-dim);
+}
+
+.dyn-muted {
+  color: var(--dyn-faint);
+  font-size: 11.5px;
+}
+
+.dyn-badge {
+  display: inline-block;
+  width: fit-content;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 500;
+}
+
+.dyn-alert {
+  border-radius: 8px;
+  padding: 7px 10px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.dyn-kv {
+  display: flex;
+  flex-direction: column;
+}
+
+.dyn-kv-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--dyn-line);
+}
+
+.dyn-kv-row:last-child {
+  border-bottom: none;
+}
+
+.dyn-kv-label {
+  color: var(--dyn-faint);
+  min-width: 0;
+}
+
+.dyn-kv-value {
+  color: var(--dyn-text);
+  font-weight: 500;
+  text-align: end;
+  font-variant-numeric: tabular-nums;
+}
+
+.dyn-list {
+  margin: 0;
+  padding-inline-start: 18px;
+  color: var(--dyn-dim);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.dyn-steps, .dyn-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.dyn-step {
+  display: flex;
+  gap: 9px;
+  align-items: baseline;
+}
+
+.dyn-step-num {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: rgba(59, 130, 246, 0.18);
+  color: #a8c4f9;
+  font-size: 10.5px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.dyn-step-title {
+  color: var(--dyn-text);
+  font-weight: 500;
+}
+
+.dyn-step-detail {
+  display: block;
+  color: var(--dyn-faint);
+  font-size: 11.5px;
+}
+
+.dyn-tl-item {
+  display: flex;
+  gap: 9px;
+  align-items: baseline;
+}
+
+.dyn-tl-dot {
+  flex-shrink: 0;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--dyn-accent);
+  margin-top: 4px;
+}
+
+.dyn-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.dyn-table th {
+  text-align: start;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--dyn-faint);
+  padding: 3px 8px 5px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.14);
+}
+
+.dyn-table td {
+  padding: 5px 8px 5px 0;
+  border-bottom: 1px solid var(--dyn-line);
+  color: var(--dyn-dim);
+}
+
+.dyn-table tr:last-child td {
+  border-bottom: none;
+}
+
+.dyn-plot {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.18);
+  height: 148px;
+}
+
+.dyn-col {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  height: 100%;
+}
+
+.dyn-colvalue {
+  font-size: 10.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 3px;
+  white-space: nowrap;
+}
+
+.dyn-vbar {
+  display: block;
+  width: 68%;
+  max-width: 34px;
+  border-radius: 4px 4px 0 0;
+}
+
+.dyn-collabel {
+  margin-top: 5px;
+  font-size: 10px;
+  line-height: 1.25;
+  color: var(--dyn-faint);
+  text-align: center;
+  height: 26px;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  word-break: break-word;
+}
+
+.dyn-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 8px;
+  padding: 8px 12px;
+  width: fit-content;
+  min-width: 120px;
+}
+
+.dyn-stat-label {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--dyn-faint);
+}
+
+.dyn-stat-value {
+  font-size: 18px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.dyn-stat-hint {
+  font-size: 11px;
+  color: var(--dyn-faint);
+}
+
+.dyn-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.dyn-progress-label {
+  font-size: 11.5px;
+  color: var(--dyn-dim);
+  white-space: nowrap;
+}
+
+.dyn-progress-track {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.dyn-progress-fill {
+  display: block;
+  height: 100%;
+  background: var(--dyn-accent);
+  border-radius: 3px;
+}
+
+.dyn-divider {
+  border: none;
+  border-top: 1px solid var(--dyn-line);
+  margin: 2px 0;
+}
+
+.dyn-link {
+  color: var(--dyn-accent);
+  text-decoration: none;
+  font-size: 12px;
+  width: fit-content;
+}
+
+.dyn-link:hover {
+  text-decoration: underline;
+}
+
+.dyn-chips {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.dyn-chip {
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+  color: var(--dyn-dim);
+  font-size: 11.5px;
+  padding: 4px 12px;
+}
+
+.dyn-chip:hover {
+  border-color: var(--dyn-accent);
+  color: var(--dyn-text);
+}
+
+/* pie + line charts for the dynamic catalog */
+.dyn-pie {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.dyn-pie-svg {
+  width: 118px;
+  height: 118px;
+  flex-shrink: 0;
+}
+
+.dyn-pie-legend {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+}
+
+.dyn-legend-row {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  font-size: 12px;
+}
+
+.dyn-legend-swatch {
+  flex-shrink: 0;
+  width: 9px;
+  height: 9px;
+  border-radius: 3px;
+  align-self: center;
+}
+
+.dyn-legend-label {
+  color: var(--dyn-dim);
+  min-width: 0;
+  flex: 1;
+}
+
+.dyn-legend-value {
+  color: var(--dyn-text);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.dyn-legend-pct {
+  color: var(--dyn-faint);
+  font-weight: 400;
+  font-size: 11px;
+}
+
+.dyn-line-svg {
+  width: 100%;
+  height: auto;
+}
+
+.dyn-line-labels {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  color: var(--dyn-faint);
+  padding: 2px 4px 0;
+}
+
+.dyn-line-legend {
+  flex-direction: row;
+  gap: 14px;
+  margin-top: 4px;
+}
