@@ -15,7 +15,12 @@ from langgraph.checkpoint.memory import InMemorySaver
 from .backend_setup import llm, clarifier_llm, store as memory_store
 from .tools_setup import TOOLS
 from .system_prompt_setup import build_system_prompt, NO_THINK
-from .service_panel import service_panel, PANEL_TOOL_NAME, COMPARE_TOOL_NAME
+from .service_panel import (
+    service_panel,
+    panel_will_render,
+    PANEL_TOOL_NAME,
+    COMPARE_TOOL_NAME,
+)
 from .dynamic_ui import DYNAMIC_TOOL_NAME
 
 logger = logging.getLogger("uvicorn.error")
@@ -495,6 +500,19 @@ def responder_agent(state: ClarifierState):
                 "\n\nIMPORTANT: The user's question is too vague or missing details to answer well. "
                 "Do NOT attempt an answer. Instead, ask ONE short, specific clarifying question to "
                 "get the missing detail (e.g. which visa type, their nationality, status, or assets)."
+            )
+        elif panel_will_render(state):
+            # The panel/chart repeats the detailed data — prose that enumerates
+            # it again is the main source of overlong answers (measured avg 59
+            # words, comparisons 90-134). Defer details to the panel.
+            prompt += (
+                "\n\nIMPORTANT — A DATA PANEL IS ATTACHED: a visual panel/chart "
+                "below your answer displays this service's detailed fees, "
+                "documents, eligibility and totals. Do NOT enumerate them in "
+                "prose. Reply in 1-2 short sentences (max 35 words): the direct "
+                "answer or headline figure, at most one caveat, then point to "
+                "the details below (e.g. 'Full breakdown below.'). No bullet "
+                "lists. No closing offers."
             )
         payload = [SystemMessage(content=prompt)] + _llm_view(state["messages"])
         response = llm.invoke(payload)

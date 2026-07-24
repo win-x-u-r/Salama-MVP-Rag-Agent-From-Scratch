@@ -265,6 +265,25 @@ def _try_dynamic(state, services: list[dict]):
     return _emit(DYNAMIC_TOOL_NAME, {"tree": tree}, "dyn")
 
 
+def panel_will_render(state) -> bool:
+    """Pre-answer check used by the responder: will this turn attach a panel
+    (fixed or dynamic)? Mirrors the emission conditions — retrieval happened,
+    the top hit is confident, and its record exists."""
+    try:
+        if state.get("mode") == "ask":
+            return False
+        services = (( _turn_retrieval(state) or {}).get("services")) or []
+        if not services:
+            return False
+        top = services[0]
+        return (
+            (top.get("score") or 0.0) >= PANEL_MIN_SCORE
+            and RECORDS_BY_NAME.get(top.get("name")) is not None
+        )
+    except Exception:
+        return False
+
+
 def _emit(tool_name: str, payload: dict, prefix: str) -> dict:
     call_id = f"{prefix}-{uuid4().hex[:8]}"
     return {
