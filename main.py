@@ -1,12 +1,15 @@
+import hashlib
 import json
 import os
 import logging
+import re
 import time
 
+import httpx
 from ag_ui_langgraph import LangGraphAgent, add_langgraph_fastapi_endpoint
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
@@ -284,6 +287,259 @@ def reset_profile():
         return {"error": "could not reset profile"}
 
 
+# ---- voice: TTS gateway (language-routed, streaming) + STT proxy ----
+# English -> Kokoro via OpenRouter's OpenAI-compatible audio API.
+# Arabic (and mixed) -> local SILMA server (see C:\Users\hazim\silma-tts),
+# falling back to an OpenRouter TTS model if the local server is down.
+#
+# Both engines synthesize a whole utterance before returning, so the answer is
+# split into clips (src/tts_chunker.py) and synthesized in order; each clip is
+# streamed out as it finishes and the browser starts playing after the first.
+# The wire format is raw little-endian 16-bit mono PCM — per-clip WAV/MP3 files
+# cannot simply be concatenated into a playable stream. The sample rate is sent
+# once in the X-TTS-Sample-Rate header, which is why the first clip is awaited
+# before the response starts: for the English path the rate is only known after
+# parsing the first WAV back from OpenRouter.
+OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "")
+TTS_EN_MODEL = os.getenv("TTS_EN_MODEL", "hexgrad/kokoro-82m")
+TTS_EN_VOICE = os.getenv("TTS_EN_VOICE", "af_heart")
+TTS_AR_BASE = os.getenv("TTS_AR_BASE", "http://127.0.0.1:8880")
+TTS_FALLBACK_MODEL = os.getenv("TTS_FALLBACK_MODEL", "openai/gpt-4o-mini-tts")
+TTS_FALLBACK_VOICE = os.getenv("TTS_FALLBACK_VOICE", "alloy")
+STT_MODEL = os.getenv("STT_MODEL", "openai/whisper-large-v3-turbo")
+# "llm" = PolyNorm-style few-shot normalization on the clarifier model with a
+# digit-preservation validator (falls back to num2words on any failure);
+# "num2words" = deterministic digits-only pass (the SILMA server also applies
+# this internally, so num2words mode just delegates).
+TTS_NORMALIZER = os.getenv("TTS_NORMALIZER", "llm").lower()
+
+_AR_CHARS = re.compile(r"[؀-ۿ]")
+_LAT_CHARS = re.compile(r"[A-Za-z]")
+
+# Small in-memory cache: repeated answers (demos!) skip re-synthesis.
+# Holds the fully accumulated PCM plus its sample rate; a hit replays instantly.
+_tts_cache: dict[str, tuple[bytes, int]] = {}
+_TTS_CACHE_MAX = 50
+
+
+def _tts_lang(text: str) -> str:
+    """Deterministic script detection — Arabic wins on majority of letters."""
+    ar = len(_AR_CHARS.findall(text))
+    lat = len(_LAT_CHARS.findall(text))
+    return "ar" if ar >= lat and ar > 0 else "en"
+
+
+def _wav_to_pcm(data: bytes) -> tuple[bytes, int]:
+    """Strip a RIFF container down to its PCM payload and sample rate.
+
+    The header is parsed rather than assumed 44 bytes: encoders vary, and some
+    emit LIST/fact chunks before `data`.
+    """
+    import struct
+
+    if data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        raise ValueError("not a RIFF/WAVE payload")
+    pos, sample_rate, bits = 12, 0, 16
+    while pos + 8 <= len(data):
+        chunk_id = data[pos:pos + 4]
+        size = struct.unpack("<I", data[pos + 4:pos + 8])[0]
+        body = pos + 8
+        if chunk_id == b"fmt ":
+            sample_rate = struct.unpack("<I", data[body + 4:body + 8])[0]
+            bits = struct.unpack("<H", data[body + 14:body + 16])[0]
+        elif chunk_id == b"data":
+            if bits != 16:
+                raise ValueError(f"expected 16-bit PCM, got {bits}-bit")
+            return data[body:body + size], sample_rate
+        pos = body + size + (size % 2)  # chunks are word-aligned
+    raise ValueError("no data chunk in WAV")
+
+
+async def _openrouter_pcm(
+    client: httpx.AsyncClient, model: str, voice: str, text: str
+) -> tuple[bytes, int]:
+    """One clip from OpenRouter as PCM. WAV is requested rather than MP3 so the
+    payload can be unwrapped without an audio decoder in the backend."""
+    r = await client.post(
+        "https://openrouter.ai/api/v1/audio/speech",
+        headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
+        json={"model": model, "input": text, "voice": voice, "response_format": "wav"},
+        timeout=60,
+    )
+    r.raise_for_status()
+    return _wav_to_pcm(r.content)
+
+
+class TTSRequest(BaseModel):
+    text: str
+
+
+async def _stream_silma(clips: list[str], meta: dict):
+    """PCM from the local SILMA server, one clip at a time."""
+    client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=5.0))
+    try:
+        async with client.stream(
+            "POST", f"{TTS_AR_BASE}/v1/audio/speech/stream", json={"chunks": clips}
+        ) as r:
+            r.raise_for_status()
+            meta["sample_rate"] = int(r.headers.get("X-Sample-Rate", 24000))
+            meta["route"] = "silma-local"
+            async for chunk in r.aiter_bytes():
+                if chunk:
+                    yield chunk
+    finally:
+        await client.aclose()
+
+
+async def _stream_openrouter(clips: list[str], meta: dict, model: str, voice: str):
+    """PCM from OpenRouter. It has no streaming speech endpoint, so the clips
+    are what make this progressive: one request each, emitted as they land."""
+    client = httpx.AsyncClient()
+    try:
+        for index, clip in enumerate(clips):
+            pcm, sample_rate = await _openrouter_pcm(client, model, voice, clip)
+            if index == 0:
+                meta["sample_rate"] = sample_rate
+            yield pcm
+    finally:
+        await client.aclose()
+
+
+@app.post("/tts")
+async def tts(req: TTSRequest):
+    text = req.text.strip()
+    if not text:
+        return {"error": "empty text"}
+
+    key = hashlib.sha1(text.encode()).hexdigest()
+    if key in _tts_cache:
+        audio, sample_rate = _tts_cache[key]
+        return Response(
+            content=audio,
+            media_type="audio/L16",
+            headers={
+                "X-TTS-Cache": "hit",
+                "X-TTS-Sample-Rate": str(sample_rate),
+                "X-TTS-Format": "pcm_s16le",
+            },
+        )
+
+    lang = _tts_lang(text)
+    t0 = time.perf_counter()
+    speak_text = text
+    norm_route = "none"
+    if lang == "ar" and TTS_NORMALIZER == "llm":
+        from src.tts_normalizer import llm_normalize
+        speak_text, norm_route = await run_in_threadpool(llm_normalize, text)
+
+    from src.tts_chunker import split_for_streaming
+    clips = split_for_streaming(speak_text)
+    if not clips:
+        return {"error": "empty text"}
+
+    # Pull the first clip before responding: it carries the sample rate for the
+    # header, and it turns a dead engine into a 502 instead of a truncated
+    # stream the client would have to interpret as success.
+    meta: dict = {"sample_rate": 24000, "route": ""}
+    if lang == "ar":
+        source = _stream_silma(clips, meta)
+        try:
+            first = await source.__anext__()
+        except Exception as e:
+            logger.error(f"[tts] local SILMA failed ({e}) -> fallback model")
+            await source.aclose()
+            meta["route"] = "fallback"
+            source = _stream_openrouter(
+                clips, meta, TTS_FALLBACK_MODEL, TTS_FALLBACK_VOICE
+            )
+            first = None
+    else:
+        meta["route"] = "kokoro"
+        source = _stream_openrouter(clips, meta, TTS_EN_MODEL, TTS_EN_VOICE)
+        first = None
+
+    if first is None:
+        try:
+            first = await source.__anext__()
+        except StopAsyncIteration:
+            first = b""
+        except Exception as e:
+            logger.error(f"[tts] synthesis failed: {e}")
+            await source.aclose()
+            return Response(
+                content=json.dumps({"error": "tts failed"}),
+                media_type="application/json",
+                status_code=502,
+            )
+
+    first_audio_s = time.perf_counter() - t0
+    logger.info(
+        f"[timing] tts first audio: {first_audio_s:.1f}s | lang={lang} "
+        f"route={meta['route']} norm={norm_route} | {len(clips)} clip(s)"
+    )
+
+    async def body():
+        buffered = bytearray(first)
+        try:
+            yield first
+            async for chunk in source:
+                buffered += chunk
+                yield chunk
+        except Exception as e:
+            # client hung up (stop pressed) or the engine died mid-answer —
+            # either way the partial audio is not worth caching
+            logger.info(f"[tts] stream ended early: {e}")
+            return
+        finally:
+            await source.aclose()
+        if len(_tts_cache) >= _TTS_CACHE_MAX:
+            _tts_cache.pop(next(iter(_tts_cache)))
+        _tts_cache[key] = (bytes(buffered), meta["sample_rate"])
+        total = time.perf_counter() - t0
+        seconds = len(buffered) / 2 / max(meta["sample_rate"], 1)
+        logger.info(
+            f"[timing] tts complete: {total:.1f}s | {seconds:.1f}s audio "
+            f"({len(buffered) // 1024}KB) | first audio at {first_audio_s:.1f}s"
+        )
+
+    return StreamingResponse(
+        body(),
+        media_type="audio/L16",
+        headers={
+            "X-TTS-Sample-Rate": str(meta["sample_rate"]),
+            "X-TTS-Format": "pcm_s16le",
+            "X-TTS-Route": meta["route"],
+            "X-TTS-Clips": str(len(clips)),
+            "X-Accel-Buffering": "no",  # don't let a proxy defeat the streaming
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.post("/stt")
+async def stt(audio: UploadFile = File(...)):
+    t0 = time.perf_counter()
+    data = await audio.read()
+    async with httpx.AsyncClient() as client:
+        try:
+            r = await client.post(
+                "https://openrouter.ai/api/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
+                files={"file": (audio.filename or "audio.webm", data, audio.content_type or "audio/webm")},
+                data={"model": STT_MODEL},
+                timeout=60,
+            )
+            r.raise_for_status()
+            text = r.json().get("text", "")
+        except Exception as e:
+            logger.error(f"[stt] transcription failed: {e}")
+            return {"error": "transcription failed"}
+    logger.info(
+        f"[timing] stt: {time.perf_counter() - t0:.1f}s | {len(data) // 1024}KB -> {text[:60]!r}"
+    )
+    return {"text": text}
+
+
 @app.post("/chat")
 async def chat(q: Query):
     # async: the Postgres checkpointer is async-only, so the graph must be
@@ -296,8 +552,15 @@ async def chat(q: Query):
             config=GRAPH_CONFIG,
         )
         logger.info(f"[timing] /chat total: {time.perf_counter() - t0:.2f}s")
-        logger.info(f"Finished processing chat request for question, response: {result['messages'][-1].content}")
-        return {"answer": result["messages"][-1].content}
+        # the last messages may be the panel tool-call pair — the answer is the
+        # last AIMessage that carries text
+        answer = next(
+            (str(m.content) for m in reversed(result["messages"])
+             if isinstance(m, AIMessage) and m.content),
+            "",
+        )
+        logger.info(f"Finished processing chat request, response: {answer[:120]}")
+        return {"answer": answer}
     except Exception as e:
         logger.error(f"Error processing chat request: {e}")
         return {"error": "An error occurred while processing your request."}
