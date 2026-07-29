@@ -1160,3 +1160,28 @@ button.icon:hover {
   gap: 14px;
   margin-top: 4px;
 }
+
+/* voice controls */
+.voice-rec {
+  border-color: var(--danger) !important;
+  color: var(--danger) !important;
+  animation: pulse-rec 1.2s infinite ease-in-out;
+}
+
+@keyframes pulse-rec {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+
+/* read-aloud button in the assistant message toolbar */
+.tts-button.tts-error {
+  color: var(--danger);
+}
+
+.tts-spinner {
+  animation: tts-spin 0.9s linear infinite;
+}
+
+@keyframes tts-spin {
+  to { transform: rotate(360deg); }
+}

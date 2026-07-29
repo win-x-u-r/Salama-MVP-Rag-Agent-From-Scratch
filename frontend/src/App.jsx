@@ -11,6 +11,8 @@ import Sidebar from "./components/Sidebar.jsx";
 import ServicePanel from "./components/ServicePanel.jsx";
 import ServiceComparison from "./components/ServiceComparison.jsx";
 import DynamicUI from "./components/DynamicUI.jsx";
+import VoiceBar from "./components/VoiceBar.jsx";
+import AssistantMessage from "./components/AssistantMessage.jsx";
 
 // CopilotKit calls agent.connect() when it attaches to a thread, expecting a
 // history replay (stock HttpAgent doesn't implement it). We replay the thread's
@@ -147,6 +149,7 @@ export default function App() {
           <span className="dot" />
           <h1>Agentic RAG</h1>
           <div className="header-actions">
+            <VoiceBar />
             <button
               className={showProfile ? "ghost active" : "ghost"}
               onClick={() => setShowProfile((v) => !v)}
@@ -167,6 +170,9 @@ export default function App() {
           <main className="chat">
             <CopilotChat
               labels={{ chatInputPlaceholder: "Type your question…" }}
+              // Swap in our assistant bubble so the newest answer gets a
+              // speaker button in its toolbar (see AssistantMessage.jsx).
+              messageView={{ assistantMessage: AssistantMessage }}
             />
           </main>
           {showProfile && (
