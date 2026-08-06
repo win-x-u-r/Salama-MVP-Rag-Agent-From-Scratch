@@ -1,6 +1,7 @@
 // Push-to-talk mic: records, sends to /api/stt, drops the transcript into the
 // composer. Playback lives with the messages themselves — see SpeakButton.
 import { useCallback, useRef, useState } from "react";
+import { interruptSpeech } from "../api/tts.js";
 
 // CopilotKit's composer only registers values that arrive as real input
 // events — set via the native setter, then dispatch.
@@ -23,6 +24,9 @@ export default function VoiceBar() {
 
   const startRec = useCallback(async () => {
     if (micState !== "idle") return;
+    // Barge-in: the user reaching for the mic is the interrupt, and it lands
+    // earlier than the send does — no point recording over our own playback.
+    interruptSpeech("mic");
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const rec = new MediaRecorder(stream, { mimeType: "audio/webm" });

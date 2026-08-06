@@ -156,6 +156,14 @@ async def _attach_durable_checkpointer():
     graph.checkpointer = AsyncPostgresSaver(pool)
     logger.info("Durable Postgres checkpointer attached.")
 
+
+@app.on_event("startup")
+async def _warm_segmenter():
+    """Pay the spaCy model load here (~3.5s) rather than on the first spoken
+    answer. No-op unless TTS_SEGMENTER=spacy."""
+    from src.tts_chunker import warmup
+    await run_in_threadpool(warmup)
+
 # AG-UI protocol endpoint: streams the run as AG-UI events (SSE) for the React client
 add_langgraph_fastapi_endpoint(
     app=app,
@@ -432,8 +440,8 @@ async def tts(req: TTSRequest):
         from src.tts_normalizer import llm_normalize
         speak_text, norm_route = await run_in_threadpool(llm_normalize, text)
 
-    from src.tts_chunker import split_for_streaming
-    clips = split_for_streaming(speak_text)
+    from src.tts_chunker import chunk as chunk_text
+    clips, segmenter = chunk_text(speak_text)
     if not clips:
         return {"error": "empty text"}
 
@@ -475,7 +483,8 @@ async def tts(req: TTSRequest):
     first_audio_s = time.perf_counter() - t0
     logger.info(
         f"[timing] tts first audio: {first_audio_s:.1f}s | lang={lang} "
-        f"route={meta['route']} norm={norm_route} | {len(clips)} clip(s)"
+        f"route={meta['route']} norm={norm_route} seg={segmenter} | "
+        f"{len(clips)} clip(s) {[len(c) for c in clips]}"
     )
 
     async def body():
@@ -510,6 +519,7 @@ async def tts(req: TTSRequest):
             "X-TTS-Format": "pcm_s16le",
             "X-TTS-Route": meta["route"],
             "X-TTS-Clips": str(len(clips)),
+            "X-TTS-Segmenter": segmenter,  # which path ran, for A/B
             "X-Accel-Buffering": "no",  # don't let a proxy defeat the streaming
             "Cache-Control": "no-store",
         },

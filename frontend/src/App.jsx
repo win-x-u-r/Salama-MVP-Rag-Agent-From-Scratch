@@ -13,6 +13,7 @@ import ServiceComparison from "./components/ServiceComparison.jsx";
 import DynamicUI from "./components/DynamicUI.jsx";
 import VoiceBar from "./components/VoiceBar.jsx";
 import AssistantMessage from "./components/AssistantMessage.jsx";
+import { interruptSpeech, installSubmitInterrupt } from "./api/tts.js";
 
 // CopilotKit calls agent.connect() when it attaches to a thread, expecting a
 // history replay (stock HttpAgent doesn't implement it). We replay the thread's
@@ -95,8 +96,14 @@ export default function App() {
     return () => window.removeEventListener("focus", refreshThreads);
   }, [refreshThreads]);
 
+  // Cuts on the keystroke itself. Mounted once, independent of the agent.
+  useEffect(() => installSubmitInterrupt(), []);
+
   useEffect(() => {
     const sub = agent.subscribe({
+      // Backstop for any submit path the DOM listeners miss (suggestion pills,
+      // programmatic sends). A no-op when the keystroke already cut.
+      onRunInitialized: () => interruptSpeech("run-start"),
       onRunFinalized: () => refreshThreads(),
     });
     return () => sub?.unsubscribe?.();
